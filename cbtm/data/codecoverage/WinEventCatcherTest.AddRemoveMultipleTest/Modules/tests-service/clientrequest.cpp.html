@@ -1,0 +1,396 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>clientrequest.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2012-2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+
+// appblast/common
+#include "AbType.h"
+#include "appBlastUtil.h"
+
+// appblast/service
+#include "ClientRequest.h"
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * ClientRequest::ClientRequest
+ *
+ *    Undocumented.
+ *
+ * Results:
+ *    Undocumented
+ *-----------------------------------------------------------------------------
+ */
+
+ClientRequest::ClientRequest(IHttpResponse *response,
+                             const std::string&amp; origin,
+                             const std::string&amp; fullUrl,
+                             const std::string&amp; sessionCookie,
+                             HttpVerb httpVerb,
+                             IAuthenticateMgr *authenticateMgr,
+                             http2::Request_ptr request)
+         : mOrigin(origin),
+           mFullUrl(fullUrl),
+           mResponse(response),
+           mAuthenticateMgr(authenticateMgr),
+           mRequestCookie(sessionCookie),
+           mHttpVerb(httpVerb),
+           mAuthenticated(false),
+           mRequest(request)
+<span style = "background-color:#fdd">{
+   ASSERT(mResponse);</span>
+
+   // TODO: fix the wasted parsing out of the param string
+<span style = "background-color:#fdd">   ParseAndAddKeyValuePairsFromURL(fullUrl);</span>
+
+   // Grab just the URL path, no parameters.
+<span style = "background-color:#fdd">   mAbsPath = SplitPathAndParams(fullUrl).first; // starts with "/"</span>
+
+   // Attempt to parse out supported URL roots from the full request path.
+<span style = "background-color:#fdd">   std::string routeSpecifier, reqPath, root;
+   std::string routing_specifier_marker = "";
+   std::string direct_routing_specifier_marker = "";</span>
+
+<span style = "background-color:#fdd">   routing_specifier_marker += http2::GATEWAYED_SECRET_MARKER;
+   direct_routing_specifier_marker  += http2::DIRECT_SECRET_MARKER;</span>
+
+   if (AbUtil::ParseUrlPathPrefix(mAbsPath,
+                                  routing_specifier_marker,
+                                  routeSpecifier,
+<span style = "background-color:#fdd">                                  reqPath)) {
+      root = routing_specifier_marker + routeSpecifier;
+   } else if (AbUtil::ParseUrlPathPrefix(mAbsPath,</span>
+                                  direct_routing_specifier_marker,
+                                  routeSpecifier,
+<span style = "background-color:#fdd">                                  reqPath)) {
+      root = direct_routing_specifier_marker + routeSpecifier;</span>
+   }
+
+<span style = "background-color:#fdd">   if (!routeSpecifier.empty()) {</span>
+      // Abs path is the path including a leading '/' if it was provided.
+<span style = "background-color:#fdd">      mAbsPath = reqPath;</span>
+
+      // Remember the routeSpecifier for use later.
+<span style = "background-color:#fdd">      mRouteSpecifier = routeSpecifier;</span>
+
+      // Reponse redirects will need to know the URL root too.
+<span style = "background-color:#fdd">      mResponse-&gt;SetUrlRoot(root);</span>
+   }
+
+<span style = "background-color:#fdd">   if (mAbsPath.empty()) {
+      mRequestPath = "";
+   } else {</span>
+      // Request path is the path with no leading '/'.
+<span style = "background-color:#fdd">      mRequestPath = mAbsPath.substr(1);</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * ClientRequest::~ClientRequest
+ *
+ *    Undocumented.
+ *
+ * Results:
+ *    Undocumented
+ *-----------------------------------------------------------------------------
+ */
+
+ClientRequest::~ClientRequest()
+<span style = "background-color:#fdd">{
+   if (mAuthenticated &amp;&amp; mAuthenticateMgr != NULL) {</span>
+      // Decrement the refcount and update the lastref for this cookie.
+<span style = "background-color:#fdd">      mAuthenticateMgr-&gt;DropCookie(mRequestCookie, GetUriValue("vauth"));</span>
+   }
+
+<span style = "background-color:#fdd">   delete mResponse;
+   mResponse = NULL;</span>
+
+   // Not owned by ClientRequest, so no need to delete it here
+<span style = "background-color:#fdd">   mAuthenticateMgr = NULL;
+   mRequest.reset();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * ClientRequest::SetAuthenticated
+ *
+ *    Undocumented.
+ *
+ * Results:
+ *    Undocumented
+ *    TODO: would be nice to return const reference
+ *-----------------------------------------------------------------------------
+ */
+
+void
+ClientRequest::SetAuthenticated(const bool authenticated)
+<span style = "background-color:#fdd">{
+   if (authenticated &amp;&amp; !mAuthenticated &amp;&amp; mAuthenticateMgr != NULL) {
+      mAuthenticateMgr-&gt;GrabCookie(mRequestCookie, GetUriValue("vauth"));</span>
+   }
+<span style = "background-color:#fdd">   mAuthenticated = authenticated;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * ClientRequest::GetValue
+ *
+ *    Undocumented.
+ *
+ * Results:
+ *    Undocumented
+ *    TODO: would be nice to return const reference
+ *-----------------------------------------------------------------------------
+ */
+
+const std::string
+ClientRequest::GetValue(const std::string&amp; key) const
+<span style = "background-color:#fdd">{</span>
+   std::vector&lt;KeyValuePair&gt;::const_iterator it;
+<span style = "background-color:#fdd">   for (it = mParams.begin(); it != mParams.end(); ++it) {
+      if (it-&gt;key.compare(key) == 0) {
+         return it-&gt;value;</span>
+      }
+   }
+<span style = "background-color:#fdd">   return "";
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * ClientRequest::GetParamString
+ *
+ *    Join all the request parameters back into a string suitable for tacking
+ *    on to a URL path. Includes the initial "?" if there is at least one
+ *    parameter. Returns "" if there are none.
+ *
+ * Results:
+ *    Something like "?a=1&amp;b=2"
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+ClientRequest::GetParamString() const
+<span style = "background-color:#fdd">{
+   std::string paramStr;
+   std::vector&lt;KeyValuePair&gt; params = GetParams();</span>
+   std::vector&lt;KeyValuePair&gt;::const_iterator i;
+
+<span style = "background-color:#fdd">   for (i = mParams.begin(); i != mParams.end(); ++i) {
+      paramStr += (paramStr.empty() ? "?" : "&amp;");
+      paramStr += i-&gt;key;
+      paramStr += "=";
+      paramStr += AbUtil::URLEncode(i-&gt;value); // Values were decoded</span>
+   }
+
+<span style = "background-color:#fdd">   return paramStr;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * ClientRequest::ParseAndAddKeyValuePairsFromURL
+ *
+ *    Undocumented.
+ *
+ * Results:
+ *    Undocumented
+ *-----------------------------------------------------------------------------
+ */
+
+void
+ClientRequest::ParseAndAddKeyValuePairsFromURL(const std::string&amp; url)
+{
+   AbUtil::ParseURLIntoKeyValuePairs(url, mParams);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * ClientRequest::ParseAndAddKeyValuePairsFromData
+ *
+ *    Undocumented.
+ *
+ * Results:
+ *    Undocumented
+ *-----------------------------------------------------------------------------
+ */
+
+void
+ClientRequest::ParseAndAddKeyValuePairsFromData(const std::string&amp; data)
+{
+   AbUtil::ParseKeyValuePairs(data.c_str(), mParams);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * ClientRequest::SplitPathAndParams
+ *
+ *    Split a URL into a path and a list of parameters. The path will ALWAYS
+ *    start with a "/" and the params will start with a "?" unless empty.
+ *
+ * Results:
+ *    A pair whose first value is the URL path and whose second is the URL
+ *    parameters.
+ *
+ * Side effects:
+ *    None.
+ *-----------------------------------------------------------------------------
+ */
+
+std::pair&lt;std::string, std::string&gt;
+ClientRequest::SplitPathAndParams(const std::string&amp; url)
+<span style = "background-color:#fdd">{
+   std::pair&lt;std::string, std::string&gt; pathAndParams;
+   pathAndParams.first = "/";
+   pathAndParams.second = "";</span>
+
+   // Start past the protocol bit
+<span style = "background-color:#fdd">   std::string::size_type start = url.find("://");
+   if (start == std::string::npos || start &gt;= url.length() - 3) {</span>
+      // Bogus URL!
+      goto out;
+   }
+<span style = "background-color:#fdd">   start += 3;</span>
+
+<span style = "background-color:#fdd">   std::string::size_type pathStart = url.find("/", start);
+   if (pathStart == std::string::npos) {</span>
+      // Empty URL means root path, no params
+      goto out;
+   }
+
+<span style = "background-color:#fdd">   std::string::size_type paramsStart = url.find("?", pathStart);
+   if (paramsStart == std::string::npos) {</span>
+      // No parameters
+<span style = "background-color:#fdd">      pathAndParams.first = url.substr(pathStart);
+      pathAndParams.second = "";
+      goto out;</span>
+   }
+
+   // Path and parameters
+<span style = "background-color:#fdd">   pathAndParams.first = url.substr(pathStart, paramsStart - pathStart);
+   pathAndParams.second = url.substr(paramsStart);</span>
+
+out:
+<span style = "background-color:#fdd">   ASSERT(pathAndParams.first.size() &gt; 0);
+   ASSERT(pathAndParams.first[0] == '/');
+   ASSERT(pathAndParams.second.empty() || pathAndParams.second[0] == '?');
+   return pathAndParams;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * ClientRequest::IsAuthorized() --
+ *
+ *    Check the request to see if the client has been previously authorized.
+ *    This is done by looking for a known session cookie. Note: this is NOT the
+ *    same as handling a 'token' parameter; see ProcessVAuth() and
+ *    ProcessHorizonToken() for that.
+ *
+ * Results:
+ *    True if already authorized, false if not.
+ * ----------------------------------------------------------------------------
+ */
+
+bool
+ClientRequest::IsAuthorized()
+<span style = "background-color:#fdd">{</span>
+   const std::string&amp; cookie = GetRequestCookie();
+<span style = "background-color:#fdd">   const std::string&amp; routeSpecifier = GetRouteSpecifier();
+   const std::string&amp; vAuth = GetUriValue("vauth");
+   bool isGood = false;
+   if (mAuthenticateMgr) {
+      isGood = mAuthenticateMgr-&gt;CheckCookie(cookie, routeSpecifier, vAuth);</span>
+   }
+<span style = "background-color:#fdd">   SetAuthenticated(isGood);
+   return isGood;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Request::GetHeaderValue
+ *
+ *    Retrieve the value from the header for the associated key
+ *
+ * Results:
+ *    key's value string. Return empty string if key is empty or not found.
+ *
+ * Side Effects:
+ *    None
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+const std::string
+ClientRequest::GetHeaderValue(const std::string key) const
+<span style = "background-color:#fdd">{
+   return mRequest-&gt;GetHeaderValue(key);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Request::GetUriValue
+ *
+ *    Retrieve the value from the URI for the associated key
+ *
+ * Results:
+ *    key's value string. Return empty string if key is empty or not found.
+ *
+ * Side Effects:
+ *    None
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+const std::string
+ClientRequest::GetUriValue(const std::string key) const
+<span style = "background-color:#fdd">{
+   return mRequest-&gt;GetUriValue(key);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Request::GetUri
+ *
+ *    Retrieve the URI
+ *
+ * Results:
+ *    URI string
+ *
+ * Side Effects:
+ *    None
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+const std::string
+ClientRequest::GetUri() const
+<span style = "background-color:#fdd">{
+   return mRequest-&gt;GetUri();
+}</span></pre>
+	</body>
+</html>

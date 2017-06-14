@@ -1,0 +1,1230 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>mainappservice.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2011-2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * MainAppService.cpp --
+ *
+ *    Entry point for AppBlast (either running standalone or as a system
+ *    service).
+ */
+
+#include &lt;objbase.h&gt;
+#include &lt;Windows.h&gt;
+#include &lt;json/json.h&gt;
+
+#include "versioninfo.h"
+
+extern "C" {
+   #include "vmwvudpd.h"
+   #include "vthread.h"
+}
+
+#include &lt;mstcpip.h&gt;
+#include &lt;winioctl.h&gt;
+
+// appblast/pipelib
+#include "PipeCommon.h"
+#include "PipeDefs.h"
+
+// appblast/common
+#include "AbProductDefs.h"
+#include "AbResult.h"
+#include "appBlastUtil.h"
+#include "Logging.h"
+
+// appblast/service
+#include "http2/Server.h"
+#include "include/IWorkerSessionMgr.h"
+#include "MainAppService.h"
+#include "PersistentConfig.h"
+#include "RequestDispatcher2.h"
+
+// Naughty strsafe goes at the end.
+#include &lt;strsafe.h&gt;
+
+// suppress C++ template expansion spam (for std::string) in logs from this file
+#undef __LOG4CXX_FUNC__
+#define __LOG4CXX_FUNC__ __FUNCTION__
+
+
+<span style = "background-color:#dfd">const std::string MAIN_APP_LOG_NAME = "MainAppService";</span>
+#define DEFINE_LOGGER log4cxx::LoggerPtr LOG = log4cxx::Logger::getLogger(MAIN_APP_LOG_NAME)
+
+static void WorkerProcessFailureHandler(DWORD exitCode);
+
+// Initialize singleton to NULL
+MainAppService *MainAppService::sInstance = NULL;
+
+// Moved here from WebServerParam.h
+enum {
+   BindToAllInterfaces = 1
+};
+
+// Defines how often we check WTS for impending session upheaval - 5 seconds
+#define WTS_CHECK_INTERVAL_US 5000000L
+// Defines how long we wait for sessions to send 'bye' messages - 2 seconds
+#define BYE_TIMEOUT_MS        2000
+// Defines how long Blast will send cached messages for respawning Blast worker
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::MainAppService --
+ *
+ *    Constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+MainAppService::MainAppService() // IN
+   : mConfig(NULL),
+     mHttpServer(NULL),
+     mRequestDispatcher(NULL),
+     mAuthenticateMgr(NULL),
+     mConnectionCtrlMgr(NULL),
+     mThreadLock(),
+     mLog(log4cxx::Logger::getLogger(MAIN_APP_LOG_NAME)),
+     mViewAgentPipeRead(NULL),
+     mViewAgentPipeWrite(NULL),
+     mPipeSA(NULL),
+     mSessionId(0xffffffff),
+     mStarted(false),
+     mUdpDeviceHandle(INVALID_HANDLE_VALUE),
+     mUdpStartPort(0),
+     mUdpNumPorts(-1),
+     mUseFilterDriver(false)
+<span style = "background-color:#dfd">{
+   bool ok = AbUtil::GetWTSSessionId(&amp;mSessionId);
+   ASSERT(ok);
+   LOG_INFO(mLog, "Now running on SessionID:%lu.", mSessionId);</span>
+
+<span style = "background-color:#dfd">   if (SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
+      LOG_INFO(mLog, "Failed to change the process priority.");</span>
+   }
+
+   //mConfig = IsStandalone() ? PersistentConfig::NewUserAppInstance() :
+   //                           PersistentConfig::NewSystemInstance();
+
+<span style = "background-color:#dfd">   mConfig = PersistentConfig::NewSystemInstance();
+   mConfig-&gt;Reload(false);</span>
+
+   // Log the values of all public registry key (GPO or local)
+<span style = "background-color:#dfd">   mConfig-&gt;LogAllKeyValues();</span>
+
+<span style = "background-color:#dfd">   bool traceEnabled = false;
+   std::string logLevel = "";
+   if (mConfig-&gt;GetBool(CONFIG_TRACE_ENABLED, traceEnabled) &amp;&amp; traceEnabled) {</span>
+<span style = "background-color:#fdd">      Log_SetTraceEnabled(traceEnabled);</span>
+<span style = "background-color:#dfd">   } else if (mConfig-&gt;GetString(CONFIG_LOG_LEVEL, logLevel)) {
+      Log_SetLogLevel(logLevel);</span>
+   }
+
+   bool securePipes = true;
+#ifdef DEVELOPER_FRIENDLY
+   /* Dev builds can make the pipes available to anyone */
+   mConfig-&gt;GetBool(CONFIG_SECURE_PIPES, securePipes);
+#endif
+   if (securePipes) {
+      /* A locked-down SECURITY_ATTRIBUTES for LocalSystem access only */
+<span style = "background-color:#dfd">      mPipeSA = pipelib::PipeSecurityAttr::CreateLocalSystemInstance(GENERIC_ALL);</span>
+   }
+
+   // Pipe client knobs.
+<span style = "background-color:#dfd">   int sendTries = 20;
+   int sendDelay = 500;
+   mConfig-&gt;GetInt(CONFIG_IPC_PIPE_SEND_TRIES, sendTries);
+   mConfig-&gt;GetInt(CONFIG_IPC_PIPE_SEND_DELAY, sendDelay);</span>
+
+   /* A pipe server that listens for requests */
+   LOG_DEBUG(mLog, "Creating IPC request pipe with %s security",
+<span style = "background-color:#dfd">                   securePipes ? "LocalSystem" : "no");</span>
+   mViewAgentPipeRead = new pipelib::PipeServer(pipelib::ABIPC_REQUEST_PIPE_NAME,
+<span style = "background-color:#dfd">                                                this, mPipeSA);</span>
+   /* A pipe client to send session events */
+   mViewAgentPipeWrite = new pipelib::PipeClient(pipelib::ABIPC_EVENT_PIPE_NAME,
+<span style = "background-color:#dfd">                                                 sendTries, sendDelay);</span>
+
+<span style = "background-color:#dfd">   VThread_Init("MainAppService-Blast");</span>
+
+<span style = "background-color:#dfd">   if (!mViewAgentPipeRead-&gt;Start()) {</span>
+<span style = "background-color:#fdd">      LOG_ERROR(mLog, "Failed to start IPC request pipe, exiting");
+      exit(AB_ERROR_PIPE_FAILURE);</span>
+   }
+
+   /* For some reasons, windows is not happy if this is not called from the
+      main thread (e.g. within the OnStart context, which will get run by
+      different thread). */
+<span style = "background-color:#dfd">   HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+   LOG_DEBUG(mLog, "Component initialized: 0x%08lx.", hr);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::~MainAppService --
+ *
+ *    Destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+MainAppService::~MainAppService()
+{
+   if (mViewAgentPipeRead) {
+      mViewAgentPipeRead-&gt;Stop();
+   }
+
+   delete mHttpServer;
+   mHttpServer = NULL;
+
+   delete mRequestDispatcher;
+   mRequestDispatcher = NULL;
+
+   if (mConnectionCtrlMgr) {
+      mConnectionCtrlMgr-&gt;Release();
+      delete mConnectionCtrlMgr;
+      mConnectionCtrlMgr = NULL;
+   }
+
+   if (mAuthenticateMgr) {
+      mAuthenticateMgr-&gt;Release();
+      delete mAuthenticateMgr;
+      mAuthenticateMgr = NULL;
+   }
+
+   delete mConfig;
+   mConfig = NULL;
+
+   delete mViewAgentPipeRead;
+   mViewAgentPipeRead = NULL;
+
+   delete mViewAgentPipeWrite;
+   mViewAgentPipeWrite = NULL;
+
+   delete mPipeSA;
+   mPipeSA = NULL;
+
+   CoUninitialize();
+   LOG_DEBUG(mLog, "Component uninitialized");
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::Get --
+ *
+ *    Gets the singleton MainAppService.
+ *
+ * Results:
+ *    The singleton, either the existing one or a freshly created one
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+MainAppService*
+MainAppService::Get()
+<span style = "background-color:#dfd">{
+   if (!sInstance) {
+      sInstance = new MainAppService();</span>
+   }
+
+   return sInstance;
+<span style = "background-color:#dfd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::OnStart --
+ *
+ *    SCM startup message callback. Nonblocking.
+ *
+ * Results:
+ *    AB_SUCCESS - success
+ *    anything else - failure.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DWORD
+MainAppService::OnStart()
+<span style = "background-color:#fdd">{
+   AbAutoLock al(mThreadLock);
+   LOG_INFO(mLog, "Starting " PRODUCT_NAME "...");</span>
+
+   DWORD result = AB_SUCCESS;
+
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "Service is now starting the Worker Session Manager.");
+   IWorkerSessionMgr *workerSessionMgr = IWorkerSessionMgr::GetInstance();
+   if (!workerSessionMgr) {
+      LOG_ERROR(mLog, "Could not create worker session manager.");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+
+<span style = "background-color:#fdd">   if (!workerSessionMgr-&gt;Start(WorkerProcessFailureHandler)) {
+      LOG_ERROR(mLog, "Failed to start WorkerSessionMgr, exiting");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+
+<span style = "background-color:#fdd">   mStarted = true;</span>
+
+<span style = "background-color:#fdd">   mConnectionCtrlMgr = IConnectionCtrlMgr::CreateInstance();
+   if (!mConnectionCtrlMgr) {
+      LOG_ERROR(mLog, "Could not create connection ctrl manager");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+<span style = "background-color:#fdd">   if (!mConnectionCtrlMgr-&gt;Initialize(workerSessionMgr)) {
+      LOG_ERROR(mLog, "Could not initialize connection ctrl manager");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+
+<span style = "background-color:#fdd">   mRequestDispatcher = new RequestDispatcher2();
+   if (!mRequestDispatcher)  {
+      LOG_ERROR(mLog, "Failed to allocate request dispatcher!");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+<span style = "background-color:#fdd">   if (!mRequestDispatcher-&gt;Initialize(mConnectionCtrlMgr, mConfig)) {
+      LOG_ERROR(mLog, "Could not initialize request dispatcher");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+
+<span style = "background-color:#fdd">   mAuthenticateMgr = IAuthenticateMgr::CreateInstance();
+   if (!mAuthenticateMgr) {
+      LOG_ERROR(mLog, "Could not create authenticate manager");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+<span style = "background-color:#fdd">   if (!mAuthenticateMgr-&gt;Initialize(workerSessionMgr)) {
+      LOG_ERROR(mLog, "Could not initialize authenticate manager");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+
+   // Boost.Asio-based implementation w/WebSocket support.
+   mHttpServer = new http2::Server(mRequestDispatcher,
+<span style = "background-color:#fdd">                                   mAuthenticateMgr);
+   if (!mHttpServer) {
+      LOG_ERROR(mLog, "Failed to allocate HTTP interface!");
+      result = AB_FAILED;
+      goto fail;</span>
+   }
+
+   int numHttpThreads;
+<span style = "background-color:#fdd">   mConfig-&gt;GetInt(CONFIG_NUM_HTTP_THREADS, numHttpThreads);</span>
+
+<span style = "background-color:#fdd">   if (!mHttpServer-&gt;Start(numHttpThreads)) {
+      LOG_ERROR(mLog, "Could not start http interface!");
+      result = AB_ERROR_HTTP;</span>
+      goto fail;
+   }
+
+   /*
+    * Installer will block a port range and write the startPort and numPorts
+    * values to registry. If the installer does not update the registry, then
+    * the default (portSecure) is used.
+    */
+<span style = "background-color:#fdd">   mConfig-&gt;GetInt(CONFIG_UDP_PORT_START, mUdpStartPort);
+   mConfig-&gt;GetInt(CONFIG_UDP_NUM_PORTS, mUdpNumPorts);</span>
+
+   // Determine if the filter driver is being used or not
+   bool filterDriverEnabled;
+<span style = "background-color:#fdd">   mConfig-&gt;GetBool(CONFIG_ENABLE_UDP, mUdpConfigEnabled);
+   mConfig-&gt;GetBool(CONFIG_UDP_ENABLE_FILTER_DRIVER, filterDriverEnabled);
+   mUseFilterDriver = mUdpConfigEnabled &amp;&amp; filterDriverEnabled;
+   if (mUseFilterDriver) {
+      if (!DoPortRangeMapping()) {</span>
+         // Don't fail the service start even if the mapping does not succeed.
+<span style = "background-color:#fdd">         LOG_ERROR(mLog, "Failed to do port range mapping.");
+         DoPortRangeCleanup();</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   return AB_SUCCESS;</span>
+
+fail:
+
+<span style = "background-color:#fdd">   if (mHttpServer) {
+      mHttpServer-&gt;Shutdown();
+      delete mHttpServer;
+      mHttpServer = NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   if (mConnectionCtrlMgr) {
+      mConnectionCtrlMgr-&gt;Release();
+      delete mConnectionCtrlMgr;
+      mConnectionCtrlMgr = NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   if (mAuthenticateMgr) {
+      mAuthenticateMgr-&gt;Release();
+      delete mAuthenticateMgr;
+      mAuthenticateMgr = NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   delete mRequestDispatcher;
+   mRequestDispatcher = NULL;</span>
+
+<span style = "background-color:#fdd">   return result;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::OnStop --
+ *
+ *    SCM stop message callback. Nonblocking.
+ *
+ * Results:
+ *    true - success.
+ *    false - failure.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::OnStop()
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();</span>
+
+<span style = "background-color:#fdd">   AbAutoLock al(mThreadLock);</span>
+   LOG_DEBUG(mLog, "Lock acquired (%I64d ms)",
+<span style = "background-color:#fdd">             AbUtil::GetClock64() - startTime);</span>
+
+<span style = "background-color:#fdd">   if (!mStarted) {</span>
+      LOG_WARN(mLog,
+<span style = "background-color:#fdd">               "Cannot stop Blast Service since it has not been started yet");
+      return false;</span>
+   } else {
+<span style = "background-color:#fdd">      LOG_INFO(mLog, "Stopping " PRODUCT_NAME "...");
+      LOG_DEBUG(mLog, "Service is shutting down Worker Process Manager.");
+      IWorkerSessionMgr::GetInstance()-&gt;Shutdown();</span>
+
+<span style = "background-color:#fdd">      if (mUseFilterDriver) {
+         DoPortRangeCleanup();</span>
+      }
+
+<span style = "background-color:#fdd">      if (mConnectionCtrlMgr) {
+         mConnectionCtrlMgr-&gt;Release();
+         delete mConnectionCtrlMgr;
+         mConnectionCtrlMgr = NULL;</span>
+      }
+
+<span style = "background-color:#fdd">      if (mAuthenticateMgr) {
+         mAuthenticateMgr-&gt;Release();
+         delete mAuthenticateMgr;
+         mAuthenticateMgr = NULL;</span>
+      }
+
+<span style = "background-color:#fdd">      if (mRequestDispatcher) {
+         delete mRequestDispatcher;
+         mRequestDispatcher = NULL;</span>
+      }
+
+      /*
+       * Make sure mHttpServer is the last one cleaned up, since that
+       * is where the IOService and httpThreads are taken down.
+       */
+<span style = "background-color:#fdd">      if (mHttpServer) {
+         LOG_DEBUG(mLog, "Service is shutting down HttpServer");
+         mHttpServer-&gt;Shutdown();
+         delete mHttpServer;
+         mHttpServer = NULL;</span>
+      }
+
+<span style = "background-color:#fdd">      mStarted = false;
+      LOG_INFO(mLog, "Stopping " PRODUCT_NAME " Completed");
+      return true;</span>
+   }
+   LOG_DEBUG(mLog, "Shutting down completed (%I64d ms)",
+             AbUtil::GetClock64() - startTime);
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::OnPause --
+ *
+ *    SCM pause message callback. Nonblocking.
+ *
+ * Results:
+ *    true - success.
+ *    false - failure.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::OnPause()
+<span style = "background-color:#fdd">{
+   LOG_ERROR(mLog, "Service pause not implemented.");
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcessFailureHandler --
+ *
+ *    It will be called from WorkerSessionMgr in case of worker process failure.
+ *
+ * Results:
+ *    true - success, false - failure.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+WorkerProcessFailureHandler(DWORD errCode) // IN
+<span style = "background-color:#fdd">{
+   DEFINE_LOGGER;</span>
+   LOG_INFO(LOG, "Shutting down after worker process failure, error:0x%08lx.",
+<span style = "background-color:#fdd">            errCode);</span>
+
+   /*
+    * By using ExitProcess(), this causes the recovery logic in the service
+    * to kick in. If we report SERVICE_STATUS_STOPPED, it's treated as a clean
+    * shutdown. It also causes the exit code to properly report in the event
+    * viewer.
+    */
+<span style = "background-color:#fdd">   ExitProcess(errCode);</span>
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::ParsePipeMessage --
+ *
+ *    Parses message from the pipe.
+ *
+ * Results:
+ *    true in case of succes or false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::ParsePipeMessage(const std::string&amp; msg,  // IN
+                                 std::string&amp; commandOut, // OUT
+                                 std::string&amp; dataOut)    // OUT
+<span style = "background-color:#fdd">{
+   size_t pos = msg.find(pipelib::ABIPC_MSG_DELIM);</span>
+
+<span style = "background-color:#fdd">   if (pos == std::string::npos) {
+      commandOut = msg;
+   } else {
+      commandOut = msg.substr(0, pos);
+      dataOut = msg.substr(pos + strlen(pipelib::ABIPC_MSG_DELIM));</span>
+   }
+
+<span style = "background-color:#fdd">   if (commandOut.empty()) {
+      LOG_ERROR(mLog, "Unexpected empty command passed from the service pipe");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * MainAppService::HandleIpPortQuery() --
+ *
+ *    This method looks up the IP address and ports that Blast is using, and
+ *    returns them in the form "&lt;ip&gt; &lt;port&gt; &lt;sport&gt;".
+ *
+ * Results:
+ *    If the query succeeds, return value is true, and ipAndPort will have a
+ *    value in the format mentioned above. If the query fails, the return
+ *    value is false, and the ipAndPort string is cleared.
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::HandleIpPortQuery(std::string&amp; ipAndPort)   // OUT
+<span style = "background-color:#fdd">{
+   std::ostringstream result;</span>
+
+<span style = "background-color:#fdd">   ipAndPort.clear();</span>
+
+   // Get IP address
+<span style = "background-color:#fdd">   std::string ip;
+   if (!AbUtil::GetServerIP(ip)) {
+      LOG_DEBUG(mLog, "Could not get the IP address.");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   result &lt;&lt; ip &lt;&lt; " ";</span>
+
+   // Get port
+<span style = "background-color:#fdd">   int port = 0;
+   if (!MainAppService::Get()-&gt;GetConfig()-&gt;GetInt(CONFIG_PORT, port)) {
+      LOG_DEBUG(mLog, "Could not get the port.");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   result &lt;&lt; port &lt;&lt; " ";</span>
+
+   // Get secure port
+<span style = "background-color:#fdd">   int portS = CONFIG_PORTSECURE_DEFAULT;</span>
+   if (!MainAppService::Get()-&gt;GetConfig()-&gt;GetInt(CONFIG_PORT_SECURE,
+                                                   portS,
+                                                   CONFIG_PORTSECURE_MIN,
+<span style = "background-color:#fdd">                                                   CONFIG_PORTSECURE_MAX)) {
+      LOG_DEBUG(mLog, "Could not get the secure port.");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   result &lt;&lt; portS;</span>
+
+<span style = "background-color:#fdd">   ipAndPort = result.str();
+   LOG_DEBUG(mLog, "IP/Port/SPort:%s.", ipAndPort.c_str());</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ * MainAppService::HandlePrepareSession() --
+ *
+ *    Handle message from the agent asking us to generate a new token for a
+ *    session. The agent can also inform us what addresses to bind to.
+ *
+ * Results:
+ *    If succeeds, true is returned and the generated response with the bound
+ *    port and the JSON token from the worker should be returned to the agent.
+ *
+ * Side effects:
+ *    Will start up worker for session if not already running.
+ *    Will bind to new addresses if they are not already bound.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::HandlePrepareSession(const std::string &amp;data,     // IN
+                                     const bool isShadowSession,  // IN
+                                     std::string &amp;response)       // OUT
+<span style = "background-color:#fdd">{
+   DWORD wtsSessionId = INVALID_TS_SESSION_ID;
+   IWorkerSessionMgr *workerSessionMgr = IWorkerSessionMgr::GetInstance();
+   std::vector&lt;std::string&gt; addresses;
+   std::string workerResponse;
+   int port = 0;
+   bool useIPv6 = false;</span>
+
+<span style = "background-color:#fdd">   if (!workerSessionMgr) {
+      LOG_ERROR(mLog, "Unable to get worker session manager instance.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::istringstream in(data);</span>
+   in &gt;&gt; wtsSessionId
+<span style = "background-color:#fdd">      &gt;&gt; port;</span>
+
+   do {
+<span style = "background-color:#fdd">      std::string address;
+      in &gt;&gt; address;</span>
+
+      /*
+       * Address is allowed to be empty to be passed to mHttpServer-&gt;Listen
+       * for the special handling.
+       */
+<span style = "background-color:#fdd">      addresses.push_back(address);
+   } while (!in.eof());</span>
+
+<span style = "background-color:#fdd">   if (wtsSessionId == INVALID_TS_SESSION_ID) {
+      LOG_ERROR(mLog, "Invalid PrepareSession wtsSessionId.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   if (addresses.empty()) {
+      LOG_ERROR(mLog, "Invalid PrepareSession address.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   if (port == 0) {
+      LOG_ERROR(mLog, "Invalid PrepareSession port.");
+      return false;</span>
+   }
+
+   // port == -1 means use default port
+<span style = "background-color:#fdd">   if (port == -1) {</span>
+      if (!MainAppService::Get()-&gt;GetConfig()-&gt;GetInt(
+            CONFIG_PORT_SECURE, port,
+<span style = "background-color:#fdd">            CONFIG_PORTSECURE_MIN, CONFIG_PORTSECURE_MAX)) {
+         LOG_ERROR(mLog, "Could not get the secure port.");
+         return false;</span>
+      }
+   }
+
+   // Bind on all specified addresses
+<span style = "background-color:#fdd">   for (size_t i = 0; i &lt; addresses.size(); ++i) {
+      std::string &amp;address = addresses[i];</span>
+
+      // If the IP contains ':' then  it must be IPv6
+<span style = "background-color:#fdd">      useIPv6 = (address.find(':') != std::string::npos);</span>
+
+<span style = "background-color:#fdd">      if (!mHttpServer-&gt;Listen(address, port)) {
+         LOG_ERROR(mLog, "Could not bind to %s:%i", address.c_str(), port);
+         return false;</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   if (isShadowSession) {
+      if (!workerSessionMgr-&gt;IsWorkerAlive(wtsSessionId)) {</span>
+         LOG_ERROR(mLog, "Cannot prepare a shadow session since no worker "
+                   "exists for the primary session, WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                   wtsSessionId);
+         return false;</span>
+      }
+
+<span style = "background-color:#fdd">      std::string primaryVAuth;
+      primaryVAuth = workerSessionMgr-&gt;GetPrimaryVAuth(wtsSessionId);
+      if (primaryVAuth.empty()) {</span>
+         LOG_ERROR(mLog, "Empty primary vAuth for WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                   wtsSessionId);
+         return false;</span>
+      }
+
+      /*
+       * Do not need to check whether it is active yet since the primary
+       * session may be in the middle of establishing connection.
+       * TODO: Revisit this later when we have decide who is managing the
+       * connection lifecycle (e.g. when primary manually disconnected, who
+       * is responsible for disconnecting allow the shadow sessions). e.g. it
+       * can be Blast or Agent.
+       */
+<span style = "background-color:#fdd">   } else {
+      if (!workerSessionMgr-&gt;StartWorkerProcess(wtsSessionId, useIPv6)) {</span>
+         LOG_ERROR(mLog, "Starting worker for WTSSessionID:%lu failed.",
+<span style = "background-color:#fdd">                   wtsSessionId);
+         return false;</span>
+      }
+   }
+
+   if (!workerSessionMgr-&gt;RequestNewToken(wtsSessionId, isShadowSession,
+<span style = "background-color:#fdd">                                          workerResponse)) {
+      return false;</span>
+   }
+
+   // Parse the JSON response for token
+<span style = "background-color:#fdd">   Json::Value json;
+   Json::Reader reader;
+   reader.parse(workerResponse, json);</span>
+   std::string parsedToken = \
+<span style = "background-color:#fdd">      json.get("a", "Parse_Not_Successful").asString();</span>
+
+   LOG_INFO(mLog, "From worker response:%s, new vAuth:%s.",
+<span style = "background-color:#fdd">            Log_Token(workerResponse).c_str(), Log_Token(parsedToken).c_str());</span>
+
+<span style = "background-color:#fdd">   if (parsedToken.compare("Parse_Not_Successful") == 0) {</span>
+      LOG_ERROR(mLog, "Invalid generated vAuth for WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                wtsSessionId);
+      return false;</span>
+   }
+
+   if (!workerSessionMgr-&gt;MapVAuthToWorkerProcess(wtsSessionId, parsedToken,
+<span style = "background-color:#fdd">                                                  !isShadowSession)) {
+      ASSERT(false);</span>
+   }
+
+   // Generate response to abctrl
+<span style = "background-color:#fdd">   std::ostringstream out;</span>
+   out &lt;&lt; port
+       &lt;&lt; pipelib::ABIPC_MSG_DELIM
+<span style = "background-color:#fdd">       &lt;&lt; workerResponse;
+   response = out.str();
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::HandleStringMessage --
+ *
+ *    Implements pipelib HandleStringMessage.
+ *    This function handles message to Blast service (from view agent).
+ *    Messages here get forwarded to Blast worker.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+MainAppService::HandleStringMessage(const std::string&amp; msg) // IN
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();
+   std::string response;
+   std::string command, data;</span>
+
+<span style = "background-color:#fdd">   IWorkerSessionMgr *workerSessionMgr = IWorkerSessionMgr::GetInstance();
+   if (!workerSessionMgr) {</span>
+      LOG_ERROR(mLog, "Unable to get worker session manager instance "
+<span style = "background-color:#fdd">                "(%I64d ms).", AbUtil::GetClock64() - startTime);
+      return PIPE_REPLY_NOT_OK;</span>
+   }
+
+<span style = "background-color:#fdd">   if (!ParsePipeMessage(msg, command, data)) {</span>
+      LOG_ERROR(mLog, "Unable to parse message (%I64d ms).",
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      return PIPE_REPLY_NOT_OK;</span>
+   }
+<span style = "background-color:#fdd">   const char * const cmdPrint = pipelib::GetCommandString(command);</span>
+
+<span style = "background-color:#fdd">   if (command == pipelib::ABIPC_NEW_TOKEN_MSG) {</span>
+      /*
+       * ABIPC_NEW_TOKEN_MSG is deprecated for abctrl.dll, it is handled
+       * for compatibility with old View agents.
+       */
+<span style = "background-color:#fdd">      std::ostringstream s;
+      DWORD wtsSessionId = ParseSessionID(data);</span>
+      /*
+       * Gives port as -1 to get the default one, and gives the address
+       * as empty for the special handling in mHttpServer-&gt;Listen
+       */
+      int port = -1;
+<span style = "background-color:#fdd">      std::string ipaddress;  /* empty */</span>
+
+      LOG_INFO(mLog, "Received command:%s from agent with WTSSessionID:%lu.",
+<span style = "background-color:#fdd">               cmdPrint, wtsSessionId);</span>
+
+      s &lt;&lt; wtsSessionId &lt;&lt; pipelib::ABIPC_MSG_DELIM
+        &lt;&lt; port &lt;&lt; pipelib::ABIPC_MSG_DELIM
+<span style = "background-color:#fdd">        &lt;&lt; ipaddress &lt;&lt; pipelib::ABIPC_MSG_DELIM;
+      if (!HandlePrepareSession(s.str(), false, response)) {
+         response = PIPE_REPLY_NOT_OK;</span>
+      }
+<span style = "background-color:#fdd">   } else if (command == pipelib::ABIPC_TERMINATE_SESSION_MSG) {</span>
+      /*
+       * Data is the token. Use that to lookup the session id (so we can send
+       * the IPC to the worker), and to lookup the Client facing connection
+       * object (so we can close the client facing websocket).
+       * Before we do any of these, clean out the map for this vAuth token,
+       * so we don't get duplicate calls to terminate the connection/session
+       * from the NotifyXXX callbacks.
+       */
+<span style = "background-color:#fdd">      size_t pos = data.find(pipelib::ABIPC_MSG_DELIM);
+      std::string vAuth = data.substr(0, pos);</span>
+
+<span style = "background-color:#fdd">      DWORD wtsSessionId = workerSessionMgr-&gt;GetWTSSessionId(vAuth);</span>
+      LOG_INFO(mLog, "Received command:%s from agent, vAuth:%s, "
+               "WTSSessionID:%lu.", cmdPrint, Log_Token(vAuth).c_str(),
+<span style = "background-color:#fdd">               wtsSessionId);</span>
+
+<span style = "background-color:#fdd">      workerSessionMgr-&gt;PurgeSession(vAuth, false);</span>
+
+      if (!workerSessionMgr-&gt;SendMessageToWorker(msg, wtsSessionId,
+<span style = "background-color:#fdd">                                                 false, response)) {
+         response = PIPE_REPLY_NOT_OK;</span>
+      }
+<span style = "background-color:#fdd">   } else if (command == pipelib::ABIPC_SESSION_COUNT_MSG) {
+      std::size_t numSessions = workerSessionMgr-&gt;GetSessionsCount();
+      std::ostringstream numSessionSS;
+      numSessionSS &lt;&lt; numSessions;
+      response = numSessionSS.str();</span>
+      LOG_INFO(mLog, "Received command:%s from agent, response:%s.",
+<span style = "background-color:#fdd">               cmdPrint, response.c_str());
+   } else if (command == pipelib::ABIPC_IP_PORT_MSG) {
+      LOG_INFO(mLog, "Received command:%s from agent.", cmdPrint);
+      if (!HandleIpPortQuery(response)) {
+         response = PIPE_REPLY_NOT_OK;
+      }
+   } else if (command == pipelib::ABIPC_PREPARE_SESSION) {
+      LOG_INFO(mLog, "Received command:%s from agent.", cmdPrint);
+      if (!HandlePrepareSession(data, false, response)) {
+         response = PIPE_REPLY_NOT_OK;
+      }
+   } else if (command == pipelib::ABIPC_SHADOW_PREPARE_SESSION) {
+      LOG_INFO(mLog, "Received command:%s from agent.", cmdPrint);</span>
+
+<span style = "background-color:#fdd">      bool enableShadowSession = false;
+      mConfig-&gt;GetBool(CONFIG_ENABLE_SHADOWSESSION, enableShadowSession);
+      if (enableShadowSession) {
+         if (!HandlePrepareSession(data, true, response)) {
+            response = PIPE_REPLY_NOT_OK;</span>
+         }
+<span style = "background-color:#fdd">      } else {
+         LOG_ERROR(mLog, "Command:%s is not supported.", cmdPrint);
+         response = PIPE_REPLY_NOT_OK;
+      }
+   } else if (command == pipelib::ABIPC_ALLOW_INPUT_MSG) {
+      size_t pos = data.find(pipelib::ABIPC_MSG_DELIM);
+      std::string vAuth = data.substr(0, pos);</span>
+
+<span style = "background-color:#fdd">      DWORD wtsSessionId = workerSessionMgr-&gt;GetWTSSessionId(vAuth);</span>
+      LOG_INFO(mLog, "Received command:%s from agent, vAuth:%s, "
+               "WTSSessionID:%lu.", cmdPrint, Log_Token(vAuth).c_str(),
+<span style = "background-color:#fdd">               wtsSessionId);</span>
+
+      // Forwards the input control message to the Blast Worker
+      if (!workerSessionMgr-&gt;SendMessageToWorker(msg, wtsSessionId,
+<span style = "background-color:#fdd">                                                 false, response)) {
+         response = PIPE_REPLY_NOT_OK;</span>
+      }
+<span style = "background-color:#fdd">   } else if (command == pipelib::ABIPC_GET_STATUS_MSG) {</span>
+      /*
+       * GET_STATUS is mostly a sanity check from the agent to perform
+       * a general health check. So just respond that everything is ok.
+       * Skip printing log entry "Received..." since this message is
+       * received periodically from agent. This will reduce log spam.
+       */
+<span style = "background-color:#fdd">      response = PIPE_REPLY_OK;
+   } else {</span>
+      LOG_ERROR(mLog, "Unexpected command:%s from agent, message:%s.",
+<span style = "background-color:#fdd">                command.c_str(), msg.c_str());
+      response = PIPE_REPLY_NOT_OK;</span>
+   }
+
+<span style = "background-color:#fdd">   if (command == pipelib::ABIPC_GET_STATUS_MSG) {</span>
+      LOG_DEBUG(mLog, "Handled command:%s from agent (%I64d ms).",
+<span style = "background-color:#fdd">                cmdPrint, AbUtil::GetClock64() - startTime);
+   } else {</span>
+      LOG_INFO(mLog, "Handled command:%s from agent (%I64d ms).",
+<span style = "background-color:#fdd">               cmdPrint, AbUtil::GetClock64() - startTime);</span>
+   }
+
+<span style = "background-color:#fdd">   return response;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::NotifyClientConnected --
+ *
+ *    Notify the dispatcher that a client connection was received for this
+ *    vAuth.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+MainAppService::NotifyClientConnected(const std::string&amp; vAuth)
+<span style = "background-color:#fdd">{
+   return mRequestDispatcher-&gt;NotifyClientConnected(vAuth);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::GetUDPPortInfo --
+ *
+ *    Provides the UDP port range info that is obtained at service startup
+ *    time. Ensures we have a centralized location from where the information
+ *    is fetched.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+MainAppService::GetUDPPortInfo(int&amp; startPort,  // OUT
+                               int&amp; numPorts)   // OUT
+<span style = "background-color:#fdd">{
+   startPort = mUdpStartPort;
+   numPorts = mUdpNumPorts;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::DoPortRangeMapping --
+ *
+ *    Send the port range information to the filter driver.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::DoPortRangeMapping()
+<span style = "background-color:#fdd">{</span>
+   LOG_INFO(mLog, "Do port range mapping, startPort: %d, numPorts: %d",
+<span style = "background-color:#fdd">            mUdpStartPort, mUdpNumPorts);</span>
+
+   /*
+    * Send port range information to filter driver.
+    */
+   mUdpDeviceHandle = CreateFileW(BLAST_UDP_DEVICE_NAME_STRING,
+          GENERIC_READ | GENERIC_WRITE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+          NULL,
+          OPEN_EXISTING,
+          FILE_ATTRIBUTE_NORMAL,
+<span style = "background-color:#fdd">          NULL);
+   if (mUdpDeviceHandle == INVALID_HANDLE_VALUE) {</span>
+      LOG_ERROR(mLog, "Could not open VMWBlastUdpDriver handle, error: %ld",
+<span style = "background-color:#fdd">                GetLastError());
+      return false;</span>
+   } else {
+<span style = "background-color:#fdd">      LOG_INFO(mLog, "Successfully opened VMWBlastUdpDevice handle.");</span>
+      int portSecure;
+      mConfig-&gt;GetInt(CONFIG_PORT_SECURE, portSecure,
+<span style = "background-color:#fdd">                      CONFIG_PORTSECURE_MIN, CONFIG_PORTSECURE_MAX);</span>
+
+      UDP_PORT_INFO portInfo;
+<span style = "background-color:#fdd">      DWORD bytesReturned = 0;
+      portInfo.startPort = mUdpStartPort;
+      portInfo.numberOfPorts = mUdpNumPorts;
+      portInfo.portSecure = portSecure;</span>
+
+      LOG_INFO(mLog, "Send port info: Start: %u, NumPorts: %u, SecurePort: %u",
+<span style = "background-color:#fdd">               portInfo.startPort, portInfo.numberOfPorts, portInfo.portSecure);</span>
+      if (!DeviceIoControl(mUdpDeviceHandle, IOCTL_BLAST_NW_SET_UDP_PORT_INFO,
+                           &amp;portInfo, sizeof(portInfo), NULL, 0,
+<span style = "background-color:#fdd">                           &amp;bytesReturned, NULL)) {</span>
+         LOG_ERROR(mLog, "Failed to send port range, error: %ld",
+<span style = "background-color:#fdd">                   GetLastError());
+         return false;</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "Successfully did port range mapping");
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::DoPortRangeCleanup --
+ *
+ *    If we have a device handle for the filter driver, send a message to
+ *    unset the port mapping.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+MainAppService::DoPortRangeCleanup()
+<span style = "background-color:#fdd">{</span>
+   LOG_INFO(mLog, "Do port range cleanup, startPort: %d, numPorts: %d",
+<span style = "background-color:#fdd">            mUdpStartPort, mUdpNumPorts);
+   if (mUdpDeviceHandle != INVALID_HANDLE_VALUE) {</span>
+      // Send a message to the Filter Driver
+<span style = "background-color:#fdd">      DWORD bytesReturned = 0;</span>
+      if (!DeviceIoControl(mUdpDeviceHandle,
+                           IOCTL_BLAST_NW_UNSET_UDP_PORT_INFO,
+<span style = "background-color:#fdd">                           NULL, 0, NULL, 0, &amp;bytesReturned, NULL)) {</span>
+         LOG_ERROR(mLog, "Could not unset port range, error = %ld\n",
+<span style = "background-color:#fdd">                   GetLastError());</span>
+      }
+      // Close the handle
+<span style = "background-color:#fdd">      CloseHandle(mUdpDeviceHandle);
+      mUdpDeviceHandle = INVALID_HANDLE_VALUE;
+      LOG_INFO(mLog, "Finished sending IOCTL to Filter Driver");</span>
+   }
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "Successfully did port range cleanup");
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::UseFilterDriver --
+ *
+ *    Indicates whether filter driver is to be used or not.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::UseFilterDriver()
+<span style = "background-color:#fdd">{
+   return mUseFilterDriver;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::IsUdpConfigEnabled --
+ *
+ *    Indicates whether UDPEnabled regkey is set or not. The key will
+ *    be updated only at service start time.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::IsUdpConfigEnabled()
+<span style = "background-color:#fdd">{
+   return mUdpConfigEnabled;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::GetClipboardEnabledFlags --
+ *
+ *    This function verifies if clipboard functionality is enabled and if
+ *    so sets the appropriate copy and paste return values.
+ *
+ * Results:
+ *    Returns a pair containing clipboard enabled flags denoting copy, paste
+ *    enabled or not as the first and second value.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::pair&lt;bool, bool&gt;
+MainAppService::GetClipboardEnabledFlags()
+{
+   DEFINE_LOGGER;
+   int val;
+
+   // Load the clipboard state from registry.
+   MainAppService::Get()-&gt;GetConfig()-&gt;GetInt(CONFIG_CLIPBOARD_TYPE, val);
+   if (val &lt; CONFIG_CLIPBOARD_DISABLE_ALL || val &gt; CONFIG_CLIPBOARD_SERVER_2_CLIENT) {
+      val = CONFIG_CLIPBOARD_CLIENT_2_SERVER;
+      LOG_INFO(LOG, "Clipboard default configuration %d is being used", val);
+   }
+
+   bool copyAllowed = (val == CONFIG_CLIPBOARD_ENABLE_ALL ||
+                       val == CONFIG_CLIPBOARD_SERVER_2_CLIENT);
+   bool pasteAllowed = (val == CONFIG_CLIPBOARD_ENABLE_ALL ||
+                        val == CONFIG_CLIPBOARD_CLIENT_2_SERVER);
+   return std::make_pair(copyAllowed, pasteAllowed);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::ParseSessionID --
+ *
+ *    Parse SessionID argument from pipe message argument.
+ *
+ * Results:
+ *    Returns SessionID or INVALID_TS_SESSION_ID by default.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DWORD
+MainAppService::ParseSessionID(const std::string&amp; data)
+<span style = "background-color:#fdd">{
+   DEFINE_LOGGER;
+   DWORD sessionId = INVALID_TS_SESSION_ID;
+   if (!data.empty()) {
+      std::istringstream sessionIdStr(data);
+      sessionIdStr &gt;&gt; sessionId;
+   } else {
+      LOG_INFO(LOG, "Empty session.");</span>
+   }
+<span style = "background-color:#fdd">   return sessionId;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * MainAppService::SendMessageToViewAgent --
+ *
+ *    Sends message through the pipe from the service to view agent process.
+ *
+ * Results:
+ *    true on success, false on error.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+MainAppService::SendMessageToViewAgent(const std::string&amp; msg, // IN
+                                       std::string&amp; response)  // IN
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();
+   DWORD err = mViewAgentPipeWrite-&gt;SendStringMessage(msg, response);</span>
+
+<span style = "background-color:#fdd">   if (err != ERROR_SUCCESS) {</span>
+      LOG_ERROR(mLog, "Could not send message to ViewAgent, error:0x%08lx "
+<span style = "background-color:#fdd">                "(%I64d ms).", err, AbUtil::GetClock64() - startTime);
+      return false;
+   } else if (response != PIPE_REPLY_OK) {</span>
+      LOG_ERROR(mLog, "Got unexpected response from ViewAgent, Response:'%s' ",
+                "(%I64d ms).", response.c_str(),
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      return false;</span>
+   }
+
+   LOG_DEBUG(mLog, "Message to ViewAgent sent (%I64d ms).",
+<span style = "background-color:#fdd">             AbUtil::GetClock64() - startTime);
+   return true;
+}</span>
+
+
+/*
+ *------------------------------------------------------------------------------
+ * pipelib::PipeLog --
+ *
+ *    Logging pipelib in AppBlast is done here. Not a superb location for this
+ *    function (pipelib classes are used elsewhere, too) but it will suffice
+ *    for now.
+ *
+ *------------------------------------------------------------------------------
+ */
+
+void pipelib::PipeLog(const char *format, ...)
+<span style = "background-color:#dfd">{
+   log4cxx::LoggerPtr pipeLog = log4cxx::Logger::getLogger("pipelib");</span>
+
+   va_list args;
+<span style = "background-color:#dfd">   va_start(args, format);
+   char buf[1024] = { 0 };
+   vsprintf_s(buf, _countof(buf), format, args);
+   LOG_DEBUG(pipeLog, buf);</span>
+   va_end(args);
+<span style = "background-color:#dfd">}</span></pre>
+	</body>
+</html>

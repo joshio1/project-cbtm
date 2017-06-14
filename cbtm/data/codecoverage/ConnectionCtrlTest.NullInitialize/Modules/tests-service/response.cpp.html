@@ -1,0 +1,425 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>response.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2013-2015 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * Response.cpp --
+ *
+ *    HTTP response object which implements Blast's IHttpResponse interface.
+ */
+
+// appblast/common
+#include "appBlastUtil.h"
+
+// appblast/service
+#include "http2/Response.h"
+
+using std::string;
+using std::vector;
+
+namespace http2 {
+
+namespace status_strings {
+
+const std::string SWITCHING_PROTOCOLS =
+<span style = "background-color:#dfd">  "HTTP/1.1 101 Switching Protocols\r\n";</span>
+const std::string OK =
+<span style = "background-color:#dfd">  "HTTP/1.1 200 OK\r\n";</span>
+const std::string MOVED_PERMANENTLY =
+<span style = "background-color:#dfd">  "HTTP/1.1 301 Moved Permanently\r\n";</span>
+const std::string MOVED_TEMPORARILY =
+<span style = "background-color:#dfd">  "HTTP/1.1 302 Moved Temporarily\r\n";</span>
+const std::string NOT_MODIFIED =
+<span style = "background-color:#dfd">  "HTTP/1.1 304 Not Modified\r\n";</span>
+const std::string BAD_REQUEST =
+<span style = "background-color:#dfd">  "HTTP/1.1 400 Bad Request\r\n";</span>
+const std::string UNAUTHORIZED =
+<span style = "background-color:#dfd">  "HTTP/1.1 401 Unauthorized\r\n";</span>
+const std::string FORBIDDEN =
+<span style = "background-color:#dfd">  "HTTP/1.1 403 Forbidden\r\n";</span>
+const std::string NOT_FOUND =
+<span style = "background-color:#dfd">  "HTTP/1.1 404 Not Found\r\n";</span>
+const std::string METHOD_NOT_ALLOWED =
+<span style = "background-color:#dfd">  "HTTP/1.1 405 Method Not Allowed\r\n";</span>
+const std::string REQUEST_ENTITY_TOO_LARGE =
+<span style = "background-color:#dfd">  "HTTP/1.1 413 Request Entity Too Large\r\n";</span>
+const std::string INTERNAL_SERVER_ERROR =
+<span style = "background-color:#dfd">  "HTTP/1.1 500 Internal Server Error\r\n";</span>
+const std::string NOT_IMPLEMENTED =
+<span style = "background-color:#dfd">  "HTTP/1.1 501 Not Implemented\r\n";</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::status_strings::Serialize
+ *
+ *    Serializes a status string given an HTTP status code.
+ *
+ * Results:
+ *    Returns a const buffer of the serialized status string.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+boost::asio::const_buffer
+Serialize(IHttpResponse::HttpStatusCode status) // IN
+<span style = "background-color:#fdd">{
+  switch (status) {</span>
+  case IHttpResponse::SWITCHING_PROTOCOLS:
+<span style = "background-color:#fdd">    return boost::asio::buffer(SWITCHING_PROTOCOLS);</span>
+  case IHttpResponse::OK:
+<span style = "background-color:#fdd">    return boost::asio::buffer(OK);</span>
+  case IHttpResponse::MOVED_PERMANENTLY:
+<span style = "background-color:#fdd">    return boost::asio::buffer(MOVED_PERMANENTLY);</span>
+  case IHttpResponse::MOVED_TEMPORARILY:
+<span style = "background-color:#fdd">    return boost::asio::buffer(MOVED_TEMPORARILY);</span>
+  case IHttpResponse::NOT_MODIFIED:
+<span style = "background-color:#fdd">    return boost::asio::buffer(NOT_MODIFIED);</span>
+  case IHttpResponse::BAD_REQUEST:
+<span style = "background-color:#fdd">    return boost::asio::buffer(BAD_REQUEST);</span>
+  case IHttpResponse::UNAUTHORIZED:
+<span style = "background-color:#fdd">    return boost::asio::buffer(UNAUTHORIZED);</span>
+  case IHttpResponse::FORBIDDEN:
+<span style = "background-color:#fdd">    return boost::asio::buffer(FORBIDDEN);</span>
+  case IHttpResponse::NOT_FOUND:
+<span style = "background-color:#fdd">    return boost::asio::buffer(NOT_FOUND);</span>
+  case IHttpResponse::METHOD_NOT_ALLOWED:
+<span style = "background-color:#fdd">    return boost::asio::buffer(METHOD_NOT_ALLOWED);</span>
+  case IHttpResponse::REQUEST_ENTITY_TOO_LARGE:
+<span style = "background-color:#fdd">    return boost::asio::buffer(REQUEST_ENTITY_TOO_LARGE);</span>
+  case IHttpResponse::INTERNAL_SERVER_ERROR:
+    return boost::asio::buffer(INTERNAL_SERVER_ERROR);
+  case IHttpResponse::NOT_IMPLEMENTED:
+<span style = "background-color:#fdd">    return boost::asio::buffer(NOT_IMPLEMENTED);</span>
+  default:
+<span style = "background-color:#fdd">    return boost::asio::buffer(INTERNAL_SERVER_ERROR);</span>
+  }
+<span style = "background-color:#fdd">}</span>
+
+} // namespace status_strings
+
+namespace misc_strings {
+
+const char name_value_separator[] = { ':', ' ' };
+const char crlf[] = { '\r', '\n' };
+const char zero = '0';
+
+} // namespace misc_strings
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::Response
+ *
+ *    Constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+Response::Response(Connection_ptr connection,
+                   bool ssl)
+   : mLog(log4cxx::Logger::getLogger("http2")),
+     mConnection(connection),
+     mIsSsl(ssl),
+     mData(NULL)
+<span style = "background-color:#fdd">{
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::~Response
+ *
+ *    Destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+Response::~Response()
+<span style = "background-color:#fdd">{
+   LOG_DEBUG(mLog, "Response %p deallocating", this);
+   delete mData;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::SetUrlRoot
+ *
+ *    Set the root path for a URL. Part of the IHttpResponse interface.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Response::SetUrlRoot(const string&amp; urlRoot) // IN
+<span style = "background-color:#fdd">{
+   mUrlRoot = urlRoot;
+   if (mUrlRoot.empty() || mUrlRoot[mUrlRoot.size() - 1] != '/') {
+      mUrlRoot += '/';</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::RespondWithText
+ *
+ *    Send an ASCII HTTP response. Part of the IHttpResponse interface.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Response::RespondWithText(IHttpResponse::HttpStatusCode statusCode,  // IN
+                          const char *reason,                        // IN
+                          const char *body,                          // IN
+                          unsigned int *bytesSentOut /* = NULL */)   // OUT
+<span style = "background-color:#fdd">{</span>
+   SendHttpResponse(statusCode, reason, body, strlen(body), "text/html",
+<span style = "background-color:#fdd">                    bytesSentOut);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::SetAuthCookieHeader
+ *
+ *    Set a session cookie header. Part of the IHttpResponse interface.
+ *
+ * Results:
+ *    Returns true on success.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Response::SetAuthCookieHeader(const std::string&amp; cookieValue) // IN
+<span style = "background-color:#fdd">{
+   if (cookieValue.empty()) {
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   string cookie = AbUtil::SESSION_COOKIE_NAME;
+   cookie += "=";
+   cookie += cookieValue;</span>
+
+<span style = "background-color:#fdd">   string cookiePath = mUrlRoot;
+   cookie += "; Path=";
+   cookie += cookiePath;
+   cookie += "; HttpOnly";</span>
+
+<span style = "background-color:#fdd">   if (mIsSsl) {
+      cookie += "; Secure";</span>
+   }
+
+<span style = "background-color:#fdd">   AddHeader("Set-Cookie", cookie);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::SendHttpResonse
+ *
+ *    Send an HTTP response. Part of the IHttpResponse interface.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Response::SendHttpResponse(IHttpResponse::HttpStatusCode statusCode,    // IN
+                           const char *reason,                          // IN
+                           const void *buffer,                          // IN
+                           size_t bufferSize,                           // IN
+                           const char *contentType,                     // IN
+                           unsigned int *bytesSentOut /* = NULL */)     // OUT
+<span style = "background-color:#fdd">{
+   SetStatusAndReason(statusCode, reason);
+   AddHeader("Content-Type", contentType);
+   AddCommonHeaders();
+   AddConnectionHeader(statusCode);</span>
+
+<span style = "background-color:#fdd">   std::stringstream ss;
+   ss &lt;&lt; bufferSize;
+   string s = ss.str();
+   AddHeader("Content-Length", s);
+   SetBody((const char *)buffer, bufferSize);</span>
+
+<span style = "background-color:#fdd">   mConnection-&gt;SendResponse(*this);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::AddHeader
+ *
+ *    Add a header to a response.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Response::AddHeader(const std::string&amp; name,    // IN
+                    const std::string&amp; value)   // IN
+<span style = "background-color:#fdd">{
+   if (!mData) {
+      mData = new Data;</span>
+   }
+<span style = "background-color:#fdd">   mData-&gt;mHeaders.push_back(Header(name, value));
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::AddCommonHeaders
+ *
+ *    Add common HTTP headers to a response.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Response::AddCommonHeaders()
+<span style = "background-color:#fdd">{
+   AddHeader("Expires", "-1");
+   AddHeader("Vary", "*");
+   AddHeader("Cache-Control", "no-cache, no-store, public, max-age=-1");
+   AddHeader("Pragma", "no-cache");
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::AddConnectionHeader
+ *
+ *    Add Connection HTTP headers to a response.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Response::AddConnectionHeader(USHORT statusCode)   // IN
+<span style = "background-color:#fdd">{</span>
+   AddHeader("Connection",
+      (mConnection-&gt;IsWebSocket() || (statusCode == SWITCHING_PROTOCOLS)) ?
+<span style = "background-color:#fdd">         "upgrade" : "keep-alive");
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::Serialize
+ *
+ *    Serializes an HTTP response to a const buffer vector.
+ *
+ * Results:
+ *    Returns a const buffer vector.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::vector&lt;boost::asio::const_buffer&gt;
+Response::Serialize(void*&amp; data) // OUT
+<span style = "background-color:#fdd">{
+   std::vector&lt;boost::asio::const_buffer&gt; buffers;
+   buffers.push_back(status_strings::Serialize(mStatus));
+   for (std::size_t i = 0; i &lt; mData-&gt;mHeaders.size(); ++i) {
+      const Header&amp; hdr = mData-&gt;mHeaders[i];
+      buffers.push_back(boost::asio::buffer(hdr.mName));
+      buffers.push_back(boost::asio::buffer(misc_strings::name_value_separator));
+      buffers.push_back(boost::asio::buffer(hdr.mValue));
+      buffers.push_back(boost::asio::buffer(misc_strings::crlf));</span>
+   }
+<span style = "background-color:#fdd">   buffers.push_back(boost::asio::buffer(misc_strings::crlf));
+   buffers.push_back(boost::asio::buffer(mData-&gt;mBody));</span>
+
+   // Ownership of the dynamic data is transferred to the caller.
+   // This is a bit wonky but Blast relies on being able to delete
+   // the response object without caring if the writes are done.
+   // Boost refuses to own what it's writing so the connection
+   // object needs to handle freeing this. It's assured to be around
+   // as long as writes are taking place.
+<span style = "background-color:#fdd">   data = mData;
+   mData = NULL;</span>
+
+<span style = "background-color:#fdd">   return buffers;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Response::Canned
+ *
+ *    Constructs a canned HTTP error response.
+ *
+ * Results:
+ *    Returns a const buffer vector.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::vector&lt;boost::asio::const_buffer&gt;
+Response::Canned(IHttpResponse::HttpStatusCode status) // IN
+<span style = "background-color:#fdd">{
+   std::vector&lt;boost::asio::const_buffer&gt; buffers;
+   buffers.push_back(status_strings::Serialize(status));
+   buffers.push_back(boost::asio::buffer("Connection"));
+   buffers.push_back(boost::asio::buffer(misc_strings::name_value_separator));
+   buffers.push_back(boost::asio::buffer("close"));
+   buffers.push_back(boost::asio::buffer(misc_strings::crlf));
+   buffers.push_back(boost::asio::buffer(misc_strings::crlf));
+   return buffers;
+}</span>
+
+} // namespace http2</pre>
+	</body>
+</html>

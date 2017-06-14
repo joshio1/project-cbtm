@@ -1,0 +1,280 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>workerprocess.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * WorkerProcess.cpp --
+ *
+ *   Implementation of WorkerProcess class that creates and
+ *   monitors the AppBlast worker process.
+ */
+
+#include "appBlastUtil.h"
+#include "WorkerProcess.h"
+
+// suppress C++ template expansion spam (for std::string) in logs from this file
+#undef __LOG4CXX_FUNC__
+#define __LOG4CXX_FUNC__ __FUNCTION__
+
+<span style = "background-color:#dfd">const std::string LOG_NAME = "WorkerProcess";</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcess::WorkerProcess --
+ *
+ *    WorkerProcess constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WorkerProcess::WorkerProcess(DWORD wtsSessionId,            // IN
+                             HANDLE workerProcess,          // IN
+                             const std::wstring &amp;pipeName)  // IN
+   : mLog(log4cxx::Logger::getLogger(LOG_NAME)),
+     mWTSSessionId(wtsSessionId),
+     mWorkerProcessHandle(workerProcess)
+<span style = "background-color:#fdd">{</span>
+   mPipeToWorker = new pipelib::PipeClient(
+                     pipeName,
+                     PIPELIB_MAX_SEND_TRIES,
+                     PIPELIB_RETRY_DELAY_MS,
+<span style = "background-color:#fdd">                     wtsSessionId);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcess::~WorkerProcess --
+ *
+ *    WorkerProcess destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WorkerProcess::~WorkerProcess()
+<span style = "background-color:#fdd">{
+   LOG_INFO(mLog, "Destructor called.");</span>
+
+<span style = "background-color:#fdd">   if (mWorkerProcessHandle != INVALID_HANDLE_VALUE) {
+      CloseHandle(mWorkerProcessHandle);
+      mWorkerProcessHandle = INVALID_HANDLE_VALUE;</span>
+   }
+
+<span style = "background-color:#fdd">   delete mPipeToWorker;
+   mPipeToWorker = NULL;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcess::SendMessageToWorker --
+ *
+ *    Sends message through the pipe from service to worker process
+ *    and reads the response.
+ *
+ * Results:
+ *    True on success, false on error.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerProcess::SendMessageToWorker(const std::string&amp; msg,  // IN
+                                   std::string&amp; response)   // OUT
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();</span>
+
+<span style = "background-color:#fdd">   if (!IsAlive()) {</span>
+      LOG_WARN(mLog, "Worker process is not running for WTSSessionID:%lu, "
+               "will not send the message (%I64d ms).", mWTSSessionId,
+<span style = "background-color:#fdd">               AbUtil::GetClock64() - startTime);
+      return false;</span>
+   }
+
+   LOG_DEBUG(mLog, "Worker process is running for WTSSessionID:%lu (%I64d ms).",
+<span style = "background-color:#fdd">             mWTSSessionId, AbUtil::GetClock64() - startTime);</span>
+
+<span style = "background-color:#fdd">   if (mPipeToWorker == NULL) {</span>
+      LOG_ERROR(mLog, "The pipe to worker is unexpectedly NULL, WTSSessionID:"
+                "%lu (%I64d ms).", mWTSSessionId,
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      return false;</span>
+   }
+
+   LOG_DEBUG(mLog, "Sending string message to worker, WTSSessionID:%lu, "
+             "(%I64d ms).", mWTSSessionId,
+<span style = "background-color:#fdd">             AbUtil::GetClock64() - startTime);</span>
+
+<span style = "background-color:#fdd">   DWORD err = mPipeToWorker-&gt;SendStringMessage(msg, response);
+   if (err != ERROR_SUCCESS) {</span>
+      LOG_ERROR(mLog, "Could not send message to worker, WTSSessionID:%lu, "
+                "error:0x%08lx (%I64d ms).", mWTSSessionId,
+<span style = "background-color:#fdd">                err, AbUtil::GetClock64() - startTime);
+      return false;</span>
+   }
+
+   LOG_DEBUG(mLog, "Message for worker in WTSSessionID:%lu sent successfully "
+<span style = "background-color:#fdd">             "(%I64d ms).", mWTSSessionId, AbUtil::GetClock64() - startTime);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcess::IsActiveSession --
+ *
+ *    Checks if the session associated with the vAuth is active.
+ *
+ * Results:
+ *    True if the session is active, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerProcess::IsActiveSession(const std::string &amp;vAuth)    // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   return mActiveVAuths.find(vAuth) != mActiveVAuths.end();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcess::AddActiveSession --
+ *
+ *    Adds the vAuth to indicate an active session.
+ *
+ * Results:
+ *    Always true.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerProcess::AddActiveSession(const std::string &amp;vAuth)    // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   mActiveVAuths.insert(vAuth);</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcess::RemoveActiveSession --
+ *
+ *    Removes the vAuth to indicate the removal of an active session.
+ *
+ * Results:
+ *    True on success, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerProcess::RemoveActiveSession(const std::string &amp;vAuth)    // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   std::set&lt;std::string&gt;::iterator iter =  mActiveVAuths.find(vAuth);</span>
+
+<span style = "background-color:#fdd">   if (iter != mActiveVAuths.end()) {
+      mActiveVAuths.erase(iter);</span>
+      LOG_INFO(mLog, "Found and removed active session with vAuth:%s.",
+<span style = "background-color:#fdd">               Log_Token(vAuth).c_str());
+      return true;</span>
+   }
+
+<span style = "background-color:#fdd">   return false;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcess::SetPrimaryVAuth --
+ *
+ *    Sets the primary vAuth.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WorkerProcess::SetPrimaryVAuth(const std::string &amp;primaryVAuth)  // IN
+<span style = "background-color:#fdd">{
+   mPrimaryVAuth = primaryVAuth;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerProcess::IsAlive --
+ *
+ *    Checks if the worker process is alive.
+ *
+ * Results:
+ *    True if alive, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerProcess::IsAlive()
+<span style = "background-color:#fdd">{</span>
+   LOG_DEBUG(mLog, "Check if worker process is alive for WTSSessionID:%lu.",
+<span style = "background-color:#fdd">             mWTSSessionId);</span>
+
+   DWORD exitCode;
+<span style = "background-color:#fdd">   BOOL success = GetExitCodeProcess(mWorkerProcessHandle, &amp;exitCode);</span>
+
+<span style = "background-color:#fdd">   if (success == FALSE) {</span>
+      LOG_ERROR(mLog, "GetExitCodeProcess failed for WTSSessionID:%lu, "
+<span style = "background-color:#fdd">                "error:0x%08lx.", mWTSSessionId, GetLastError());
+      return false;</span>
+   } else {
+<span style = "background-color:#fdd">      if (exitCode == STILL_ACTIVE) {</span>
+         LOG_DEBUG(mLog, "Worker process is alive for WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                   mWTSSessionId);
+      } else {</span>
+         LOG_DEBUG(mLog, "Worker process not found for WTSSessionID:%lu, "
+<span style = "background-color:#fdd">                   "exitcode:0x%08lx.", mWTSSessionId, exitCode);</span>
+      }
+
+<span style = "background-color:#fdd">      return exitCode == STILL_ACTIVE;</span>
+   }
+<span style = "background-color:#fdd">}</span></pre>
+	</body>
+</html>

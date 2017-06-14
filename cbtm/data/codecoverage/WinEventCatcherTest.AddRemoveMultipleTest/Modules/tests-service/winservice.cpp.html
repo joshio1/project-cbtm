@@ -1,0 +1,396 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>winservice.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2011-2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * WinService.cpp --
+ *
+ *   A windows service wrapper class that hides the SCM interaction detail.
+ */
+
+#include &lt;Windows.h&gt;
+#include &lt;Wtsapi32.h&gt;
+#include &lt;crtdbg.h&gt;
+
+// appblast/common
+#include "AbResult.h"
+#include "appBlastUtil.h"
+
+// appblast/service
+#include "include/IWorkerSessionMgr.h"
+#include "WinService.h"
+
+typedef BOOL
+(WINAPI *WTSConnectSessionWType)(ULONG logonId, ULONG targetLogonId,
+                                 PWSTR password, BOOL wait);
+
+typedef BOOL
+(WINAPI *WinStationConnectWType)(HANDLE server, DWORD sessionId,
+                                 DWORD targetSessionId, PWSTR password,
+                                 BOOL bWait);
+
+WinService *WinService::sSvcInstance = NULL;
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::WinService --
+ *
+ *    Constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WinService::WinService()
+   : mRanOnce(false)
+   , mCallbacks(NULL)
+   , mExitCode(0)
+   , mLog(log4cxx::Logger::getLogger("winService"))
+<span style = "background-color:#fdd">{
+}</span>
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::ServiceMain --
+ *
+ *    The ServiceMain entry point that will be used in SERVICE_TABLE_ENTRY.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WinService::ServiceMain(DWORD argc,
+                        LPWSTR *argv)
+{
+   sSvcInstance-&gt;ServiceMainInst(argc, argv);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::ServiceMainInst --
+ *
+ *    Instance level function of ServiceMain that has access to members.
+ *    It registers service control handler, invokes OnStart event handler,
+ *    and report that the service is started.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WinService::ServiceMainInst(DWORD argc,   // IN
+                            LPWSTR *argv) // IN
+{
+   DWORD res;
+   mStatusHandle = RegisterServiceCtrlHandlerExW(L"",
+                                                 &amp;WinService::ServiceCtrlHandler,
+                                                 this);
+
+   if (!mStatusHandle) {
+      LOG_ERROR(mLog, "RegisterServiceCtrlHandlerW failed, error:0x%08lx.",
+                GetLastError());
+      return;
+   }
+
+   res = mCallbacks-&gt;OnStart();
+   AbUtil::WriteErrorToRegistry(res);
+
+   if (res == AB_SUCCESS) {
+      ReportStatusRunning();
+   } else {
+      ReportStatusStopped(res);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::ServiceCtrlHandler --
+ *
+ *    The service control code handler that will be registered with
+ *    RegisterServiceCtrlHandlerW
+ *
+ * Results:
+ *    Depends on ctrlCode, see MSDN.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DWORD
+WinService::ServiceCtrlHandler(DWORD ctrlCode,    // IN
+                               DWORD eventType,   // IN
+                               LPVOID eventData,  // IN
+                               LPVOID context)    // IN
+{
+   WinService *that = (WinService *)context;
+   return that-&gt;ServiceCtrlHandlerInst(ctrlCode, eventType, eventData);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::ServiceCtrlHandlerInst --
+ *
+ *    The instance leve of the service control code handler, which has access
+ *    to instance members.  Currently, it only handles STOP code.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DWORD
+WinService::ServiceCtrlHandlerInst(DWORD ctrlCode,    // IN
+                                   DWORD eventType,   // IN
+                                   LPVOID eventData)  // IN
+{
+   WTSSESSION_NOTIFICATION *sessionInfo = NULL;
+   DWORD retCode = NO_ERROR;
+   DWORD wtsSessionId = INVALID_TS_SESSION_ID;
+
+   switch (ctrlCode) {
+   case SERVICE_CONTROL_STOP:
+   case SERVICE_CONTROL_SHUTDOWN:
+      LOG_INFO(mLog, ctrlCode == SERVICE_CONTROL_STOP ?
+                        "SERVICE_CONTROL_STOP" : "SERVICE_CONTROL_SHUTDOWN");
+      ReportStatusStopPending();
+      mCallbacks-&gt;OnStop();
+      ReportStatusStopped(mExitCode);
+      break;
+
+   case SERVICE_CONTROL_INTERROGATE:
+      // Should return NO_ERROR; See MSDN.
+      break;
+
+   case SERVICE_CONTROL_SESSIONCHANGE:
+      sessionInfo = (WTSSESSION_NOTIFICATION*)eventData;
+      wtsSessionId = sessionInfo-&gt;dwSessionId;
+
+      if (eventType == WTS_SESSION_LOGON) {
+         LOG_INFO(mLog, "WTS_SESSION_LOGON, WTSSessionID:%lu.", wtsSessionId);
+         svcConsoleStateChanged.emit(CS_LOGGED_ON, wtsSessionId);
+      } else if (eventType == WTS_SESSION_UNLOCK) {
+         LOG_INFO(mLog, "WTS_SESSION_UNLOCK, WTSSessionID:%lu.", wtsSessionId);
+         svcConsoleStateChanged.emit(CS_UNLOCKED, wtsSessionId);
+      } else if (eventType == WTS_SESSION_LOGOFF ||
+                 eventType == WTS_SESSION_LOCK) {
+         DWORD id =
+            IWorkerSessionMgr::GetInstance()-&gt;GetWorkerProcessWTSSessionId();
+         // Only interested in the worker process' session.
+         if (id == wtsSessionId) {
+            if (eventType == WTS_SESSION_LOCK) {
+               LOG_INFO(mLog, "WTS_SESSION_LOCK, WTSSessionID:%lu.",
+                        wtsSessionId);
+               svcConsoleStateChanged.emit(CS_LOCKED, wtsSessionId);
+            } else if (eventType == WTS_SESSION_LOGOFF) {
+               LOG_INFO(mLog, "WTS_SESSION_LOGOFF, WTSSessionID:%lu.",
+                        wtsSessionId);
+               svcConsoleStateChanged.emit(CS_LOGGED_OFF, wtsSessionId);
+            }
+         } else {
+            LOG_INFO(mLog, "Skipping WTS_SESSION_LOCK or WTS_SESSION_LOGOFF "
+                     "for WTSSessionID:%lu since worker is using WTSSessionID"
+                     ":%lu, EventType:0x%08lx.", wtsSessionId, id, eventType);
+         }
+      }
+      break;
+
+   default:
+      retCode = ERROR_CALL_NOT_IMPLEMENTED;
+      break;
+   }
+   return retCode;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::ReportStatusStopPending --
+ *
+ *    Method that reports the service is pending stop.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WinService::ReportStatusStopPending()
+{
+   SERVICE_STATUS svcStatus;
+   ZeroMemory(&amp;svcStatus, sizeof svcStatus);
+   svcStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+
+   svcStatus.dwCurrentState = SERVICE_STOP_PENDING;
+   if (!SetServiceStatus(mStatusHandle, &amp;svcStatus)) {
+      LOG_WARN(mLog, "SetServiceStatus failed, error:0x%08lx.", GetLastError());
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::ReportStatusStopped --
+ *
+ *    Method that reports the service has stopped.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WinService::ReportStatusStopped(DWORD exitCode) //IN: Process exit code.
+{
+   SERVICE_STATUS svcStatus;
+   ZeroMemory(&amp;svcStatus, sizeof svcStatus);
+   svcStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+
+   svcStatus.dwCurrentState = SERVICE_STOPPED;
+   svcStatus.dwWin32ExitCode = exitCode;
+   if (!SetServiceStatus(mStatusHandle, &amp;svcStatus)) {
+      LOG_WARN(mLog, "SetServiceStatus failed, error:0x%08lx.",
+               GetLastError());
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::ReportStatusRunning --
+ *
+ *    Method that reports the service is in running state.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WinService::ReportStatusRunning()
+{
+   SERVICE_STATUS svcStatus;
+   ZeroMemory(&amp;svcStatus, sizeof svcStatus);
+   svcStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+
+   svcStatus.dwCurrentState = SERVICE_RUNNING;
+   svcStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP
+                                  | SERVICE_ACCEPT_SESSIONCHANGE
+                                  | SERVICE_ACCEPT_SHUTDOWN;
+   if (!SetServiceStatus(mStatusHandle, &amp;svcStatus)) {
+      LOG_WARN(mLog, "SetServiceStatus failed, error:0x%08lx.",
+               GetLastError());
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::GetInstance --
+ *
+ *    Get the singleton instance.  It is not thread safe.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WinService*
+WinService::GetInstance()
+<span style = "background-color:#fdd">{
+   if (!sSvcInstance) {
+      sSvcInstance = new WinService();</span>
+   }
+   return sSvcInstance;
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::~WinService --
+ *
+ *    Destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WinService::~WinService()
+{
+   sSvcInstance = NULL;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinService::~RunAsService --
+ *
+ *    Main method of WinService.  Caller invoke this method so that the process
+ *    will connect to service control manager.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WinService::RunAsService(IServiceCtrlCallback *callbacks) // IN: Callbacks instance
+{
+   ASSERT(callbacks);
+   ASSERT(!mRanOnce);
+
+   SERVICE_TABLE_ENTRYW dispatchTable[] =
+      {{L"", (LPSERVICE_MAIN_FUNCTIONW)ServiceMain}, { NULL, NULL}};
+
+   LOG_INFO(mLog, "Starting the service ...");
+   mCallbacks = callbacks;
+   if (!StartServiceCtrlDispatcherW(dispatchTable)) {
+      LOG_ERROR(mLog, "StartServiceCtrlDispatcherW has failed, error:0x%08lx.",
+                GetLastError());
+      return false;
+   }
+   mRanOnce = true;
+   return true;
+}</pre>
+	</body>
+</html>

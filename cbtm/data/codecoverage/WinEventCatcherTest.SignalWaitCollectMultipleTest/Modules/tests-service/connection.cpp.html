@@ -1,0 +1,1751 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>connection.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2013-2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * Connection.cpp --
+ *
+ *    HTTP connection object.
+ */
+
+#include &lt;boost/logic/tribool.hpp&gt;
+
+// appblast/common
+#include "appBlastUtil.h"
+
+#include "http2/Connection.h"
+#include "http2/Response.h"
+#include "http2/WebSocket.h"
+#include "MainAppService.h"
+
+using std::string;
+
+// Uncomment this for per-request logging.
+//#define DEBUG_HTTP2
+
+namespace http2 {
+
+// Same values from http.cpp
+
+static const int HTTP_POST_ENTITY_LIMIT = 64 * 1024;
+
+// Maximum number of bytes to read before aborting an incoming request.
+static const std::size_t HTTP_MAX_REQUEST_SIZE = 16 * 1024;
+
+// Maximum number of seconds to wait to receive a full request.
+static const int HTTP_MAX_IDLE_SECS = 30;
+
+// Maximum number of simultaneous HTTP connections to accept.
+static const int HTTP_MAX_CONNECTION_COUNT = 2048;
+
+// Simplify conditional SSL handling.
+#define HTTP2_CONN_PICK_READ(handler)                                   \
+   do {                                                                 \
+      if (mIsSsl) {                                                     \
+         GetSSLSocket().async_read_some(boost::asio::buffer(mBuffer),   \
+            boost::bind(handler,                                        \
+                        shared_from_this(),                             \
+                        boost::asio::placeholders::error,               \
+                        boost::asio::placeholders::bytes_transferred)); \
+      } else {                                                          \
+         GetTCPSocket().async_read_some(boost::asio::buffer(mBuffer),   \
+            boost::bind(handler,                                        \
+                        shared_from_this(),                             \
+                        boost::asio::placeholders::error,               \
+                        boost::asio::placeholders::bytes_transferred)); \
+      }                                                                 \
+   } while(0)
+
+#define HTTP2_CONN_PICK_WRITE(handler, buffers)                         \
+   do {                                                                 \
+      if (mIsSsl) {                                                     \
+         boost::asio::async_write(GetSSLSocket(), buffers,              \
+            boost::bind(handler,                                        \
+                        shared_from_this(),                             \
+                        boost::asio::placeholders::error,               \
+                        boost::asio::placeholders::bytes_transferred)); \
+      } else {                                                          \
+         boost::asio::async_write(GetTCPSocket(), buffers,              \
+            boost::bind(handler,                                        \
+                        shared_from_this(),                             \
+                        boost::asio::placeholders::error,               \
+                        boost::asio::placeholders::bytes_transferred)); \
+      }                                                                 \
+   } while(0)
+
+// Static initializations.
+boost::atomic&lt;int&gt; Connection::mConnectionCount(0);
+
+HMODULE Connection::mIphlpapiDLL = NULL;
+
+Connection::GetTcpTableFunction* Connection::MyGetTcpTable = NULL;
+
+Connection::SetPerTcpConnectionEStatsFunction* Connection::MySetPerTcpConnectionEStats = NULL;
+
+Connection::GetPerTcpConnectionEStatsFunction* Connection::MyGetPerTcpConnectionEStats = NULL;
+
+<span style = "background-color:#dfd">boost::mutex Connection::mIphlpapiLock;</span>
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::Connection
+ *
+ *    Connection constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+Connection::Connection(boost::asio::io_service&amp; ioService,
+                       boost::asio::ssl::context&amp; sslCtx,
+                       IRequestDispatcher* dispatcher,
+                       IAuthenticateMgr* authenticateMgr,
+                       bool ssl,
+                       bool udpEnabled,
+                       const std::string &amp;udpIpAddr,
+                       int udpPort)
+  : mLog(log4cxx::Logger::getLogger("http2")),
+    mSocket(ioService, sslCtx),
+    mRequest(new Request()),
+    mDispatcher(dispatcher),
+    mTotalBytesXferred(0),
+    mResponseData(NULL),
+    mIsWebSocket(false),
+    mIdleTimer(ioService),
+    mDisconnectOnWrite(false),
+    mIOService(ioService),
+    mStatsEnabled(false),
+    mIsSsl(ssl),
+    mUdpEnabled(udpEnabled),
+    mUdpHeadersPresent(false),
+    mUdpIpAddr(udpIpAddr),
+    mUdpPort(udpPort),
+    mAuthenticateMgr(authenticateMgr)
+<span style = "background-color:#fdd">{
+   CancelIdleTimer();
+   mSavedCookie.clear();
+   mSubprotocol.clear();
+   mSavedUrl.clear();
+   mVAuth.clear();
+   mConnectionCount++;
+   mClientConnectionInfo.userConfigMode = BLAST_SERVICE_USER_MODE_UNKNOWN;
+   mClientConnectionInfo.brokerProtocol = BLAST_SERVICE_PROTOCOL_UNKNOWN;
+   mClientConnectionInfo.primaryProtocol = BLAST_SERVICE_PROTOCOL_UNKNOWN;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::~Connection
+ *
+ *    Connection destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+Connection::~Connection()
+<span style = "background-color:#fdd">{
+   LOG_DEBUG(mLog, "Connection %p (#%d): Destroying...", this, mConnectionCount);</span>
+
+<span style = "background-color:#fdd">   if (!IsClosed()) {
+      Close();</span>
+   }
+
+   // See comment in Response::Serialize().
+<span style = "background-color:#fdd">   if (mResponseData) {
+      delete static_cast&lt;Response::Data*&gt;(mResponseData);
+      mResponseData = NULL;</span>
+   }
+
+   // Not owned by connection so just set to NULL
+<span style = "background-color:#fdd">   mAuthenticateMgr = NULL;</span>
+
+<span style = "background-color:#fdd">   mConnectionCount--;
+   LOG_INFO(mLog, "Connection %p (#%d) destroyed.", this, mConnectionCount);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetSharedPtr
+ *
+ *    Allow holders of the raw pointer to get a valid shared_ptr
+ *
+ * Results:
+ *    Shared pointer (of this connection object)
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+Connection_ptr
+Connection::GetSharedPtr()
+{
+   return shared_from_this();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::Start
+ *
+ *    Called to begin reading and parsing a new request on a new connection.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::Start()
+<span style = "background-color:#fdd">{
+   std::ostringstream clientEndpoint;
+   clientEndpoint &lt;&lt; GetSocket().remote_endpoint();
+   std::ostringstream serverEndpoint;
+   serverEndpoint &lt;&lt; GetSocket().local_endpoint();</span>
+
+   LOG_INFO(mLog, "Connection %p (#%d): New connection accepted, source:%s, target:%s.",
+            this, mConnectionCount, clientEndpoint.str().c_str(),
+<span style = "background-color:#fdd">            serverEndpoint.str().c_str());</span>
+
+<span style = "background-color:#fdd">   if (mConnectionCount &gt;= HTTP_MAX_CONNECTION_COUNT) {</span>
+      LOG_FATAL(mLog, "Connection %p: connection limit reached (%d/%d). "
+                "Disconnecting.",
+<span style = "background-color:#fdd">                this, mConnectionCount, HTTP_MAX_CONNECTION_COUNT);
+      return;</span>
+   }
+
+   // Don't wait forever for a request.
+<span style = "background-color:#fdd">   StartIdleTimer();</span>
+
+<span style = "background-color:#fdd">   if (mIsSsl) {</span>
+      GetSSLSocket().async_handshake(boost::asio::ssl::stream_base::server,
+         boost::bind(&amp;Connection::OnSslHandshake,
+                     shared_from_this(),
+<span style = "background-color:#fdd">                     boost::asio::placeholders::error));
+   } else {</span>
+      GetTCPSocket().async_read_some(boost::asio::buffer(mBuffer),
+         boost::bind(&amp;Connection::OnReadRequest,
+                     shared_from_this(),
+                     boost::asio::placeholders::error,
+<span style = "background-color:#fdd">                     boost::asio::placeholders::bytes_transferred));</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::OnSslHandshake
+ *
+ *    SSL handshake callback used prior to reading.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::OnSslHandshake(const boost::system::error_code&amp; e)
+<span style = "background-color:#fdd">{
+   if (IsClosed()) {</span>
+      return;
+   }
+
+<span style = "background-color:#fdd">   if (e) {</span>
+      LOG_DEBUG(mLog, "SSL handshake error, code: %d [%s]",
+<span style = "background-color:#fdd">                e.value(), e.message().c_str());
+      Close();
+      return;</span>
+   }
+
+   GetSSLSocket().async_read_some(boost::asio::buffer(mBuffer),
+      boost::bind(&amp;Connection::OnReadRequest,
+                  shared_from_this(),
+                  boost::asio::placeholders::error,
+<span style = "background-color:#fdd">                  boost::asio::placeholders::bytes_transferred));
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::OnReadRequest
+ *
+ *    Read callback used prior to parsing a full request.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::OnReadRequest(const boost::system::error_code&amp; e, // IN
+                          std::size_t bytesXferred)           // IN
+<span style = "background-color:#fdd">{
+   if (IsClosed()) {</span>
+      return;
+   }
+
+<span style = "background-color:#fdd">   if (e) {</span>
+      LOG_WARN(mLog, "Connection %p: "
+               "Error reading request, code: %d [%s: %s]. Closing connection.",
+<span style = "background-color:#fdd">               this, e.value(), e.category().name(), e.message().c_str());
+      Close();
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   mTotalBytesXferred += bytesXferred;</span>
+
+<span style = "background-color:#fdd">   if (mTotalBytesXferred &gt; HTTP_MAX_REQUEST_SIZE) {</span>
+      // DoS prevention: Don't try to read too big of a request.
+      LOG_WARN(mLog, "Request has exceeded the maximum request size, "
+               "size: %ld, max: %ld", mTotalBytesXferred,
+<span style = "background-color:#fdd">               HTTP_MAX_REQUEST_SIZE);
+      SendError(IHttpResponse::BAD_REQUEST);
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   boost::tribool result;</span>
+
+   boost::tie(result, boost::tuples::ignore) =
+<span style = "background-color:#fdd">      mParser.Parse(*mRequest, mBuffer.data(), mBuffer.data() + bytesXferred);</span>
+
+<span style = "background-color:#fdd">   if (result) {</span>
+#ifdef DEBUG_HTTP2
+      LOG_DEBUG(mLog, "Parsed request: method '%s', URI '%s'",
+         mRequest-&gt;mMethodStr.c_str(), mRequest-&gt;mUri.c_str());
+#endif
+
+<span style = "background-color:#fdd">      if (mRequest-&gt;mMethod == Request::UNSUPPORTED) {</span>
+         LOG_WARN(mLog, "Received request with unsupported method '%s'",
+<span style = "background-color:#fdd">            mRequest-&gt;mMethodStr.c_str());
+         SendError(IHttpResponse::NOT_IMPLEMENTED);
+         return;</span>
+      }
+
+<span style = "background-color:#fdd">      const std::size_t headerBytes = mParser.GetBytesSeen();
+      const std::size_t lastHeaderBytes = mParser.GetBytesLastSeen();
+      const std::size_t totalBytesXferred = mTotalBytesXferred;</span>
+
+<span style = "background-color:#fdd">      mTotalBytesXferred = 0;
+      mParser.Reset();</span>
+
+      // Read a body if we need to.
+      if (mRequest-&gt;mMethod == Request::POST ||
+<span style = "background-color:#fdd">          mRequest-&gt;mMethod == Request::PUT) {</span>
+
+<span style = "background-color:#fdd">         string contentLengthStr = mRequest-&gt;GetHeaderValue("content-length");
+         mRequest-&gt;mContentLength = atoi(contentLengthStr.c_str());</span>
+
+<span style = "background-color:#fdd">         if (mRequest-&gt;mContentLength &gt; 0) {
+            if (mRequest-&gt;mContentLength &gt;= HTTP_POST_ENTITY_LIMIT) {</span>
+               LOG_WARN(mLog, "Received a request with too large of an entity"
+<span style = "background-color:#fdd">                  " body '%d' bytes.", mRequest-&gt;mContentLength);
+               SendError(IHttpResponse::REQUEST_ENTITY_TOO_LARGE);
+               return;</span>
+            }
+
+<span style = "background-color:#fdd">            const std::size_t bodyBytes = totalBytesXferred - headerBytes;</span>
+
+            // Maybe we read body bytes too.
+<span style = "background-color:#fdd">            if (bodyBytes) {
+               mRequest-&gt;mBody.append(mBuffer.data() + lastHeaderBytes, bodyBytes);</span>
+            }
+
+<span style = "background-color:#fdd">            if (mRequest-&gt;mBody.size() &lt; mRequest-&gt;mContentLength) {</span>
+               // Read more body bytes.
+<span style = "background-color:#fdd">               HTTP2_CONN_PICK_READ(&amp;Connection::OnReadRequestBody);
+               return;</span>
+            }
+         }
+<span style = "background-color:#fdd">      }</span>
+
+#ifdef DEBUG_HTTP2
+      LOG_DEBUG(mLog, "body: '%s'", mRequest-&gt;mBody.c_str());
+#endif
+
+<span style = "background-color:#fdd">      if (IsWSUpgradeRequest()) {
+         bool res = HandleUpgradeRequest();</span>
+         LOG_DEBUG(mLog, "Connection %p (#%d) handle upgrade request %i",
+<span style = "background-color:#fdd">                   this, mConnectionCount, res);
+      } else {</span>
+         // Create the familiar ClientRequest for the rest of Blast to use.
+<span style = "background-color:#fdd">         ClientRequest *cp = CreateClientRequest();
+         if (!cp) {</span>
+            LOG_ERROR(mLog, "Connection %p: "
+<span style = "background-color:#fdd">                      "NULL return from CreateClientRequest", this);
+            SendError(IHttpResponse::INTERNAL_SERVER_ERROR);
+            return;</span>
+         }
+
+         // Hand it off to Blast.
+<span style = "background-color:#fdd">         mDispatcher-&gt;Dispatch(cp);
+      }
+   } else if (!result) {
+      LOG_WARN(mLog, "Bad request received.");
+      SendError(IHttpResponse::BAD_REQUEST);
+   } else {</span>
+      // Need more bytes to complete parsing.
+<span style = "background-color:#fdd">      HTTP2_CONN_PICK_READ(&amp;Connection::OnReadRequest);</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::OnReadRequestBody
+ *
+ *    Read callback used prior to reading a full request body.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::OnReadRequestBody(const boost::system::error_code&amp; e, // IN
+                              std::size_t bytesXferred)           // IN
+<span style = "background-color:#fdd">{
+   if (IsClosed()) {</span>
+      return;
+   }
+
+<span style = "background-color:#fdd">   if (e) {</span>
+      LOG_WARN(mLog, "Connection %p: Error reading request body, "
+               "code: %d [%s: %s]. Closing connection.",
+<span style = "background-color:#fdd">               this, e.value(), e.category().name(), e.message().c_str());
+      Close();
+      return;</span>
+   }
+
+   // XXX todo: don't copy.
+<span style = "background-color:#fdd">   mRequest-&gt;mBody.append(mBuffer.data(), bytesXferred);</span>
+
+<span style = "background-color:#fdd">   if (mRequest-&gt;mBody.size() &lt; mRequest-&gt;mContentLength) {</span>
+      // Read more body bytes.
+<span style = "background-color:#fdd">      HTTP2_CONN_PICK_READ(&amp;Connection::OnReadRequestBody);
+   } else {</span>
+#ifdef DEBUG_HTTP2
+      LOG_DEBUG(mLog, "body: '%s'", mRequest-&gt;mBody.c_str());
+#endif
+<span style = "background-color:#fdd">      if (IsWSUpgradeRequest()) {
+         bool res = HandleUpgradeRequest();</span>
+         LOG_DEBUG(mLog, "Connection %p (#%d) handle upgrade request %i",
+<span style = "background-color:#fdd">                   this, mConnectionCount, res);
+      } else {</span>
+         // Create the familiar ClientRequest for the rest of Blast to use.
+<span style = "background-color:#fdd">         ClientRequest *cp = CreateClientRequest();
+         if (!cp) {</span>
+            LOG_ERROR(mLog, "Connection %p: "
+<span style = "background-color:#fdd">                      "NULL return from CreateClientRequest", this);
+            SendError(IHttpResponse::INTERNAL_SERVER_ERROR);
+            return;</span>
+         }
+         // Hand it off to Blast.
+<span style = "background-color:#fdd">         mDispatcher-&gt;Dispatch(cp);</span>
+      }
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::SendError
+ *
+ *    Send back a canned error response.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::SendError(IHttpResponse::HttpStatusCode status) // IN
+<span style = "background-color:#fdd">{
+   std::vector&lt;boost::asio::const_buffer&gt; buffers = Response::Canned(status);
+   HTTP2_CONN_PICK_WRITE(&amp;Connection::OnWriteError, buffers);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::OnWriteError
+ *
+ *    Write callback after sending an error. Also closes the connection.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::OnWriteError(const boost::system::error_code&amp; e, // IN
+                         std::size_t bytesXferred)           // IN
+<span style = "background-color:#fdd">{
+   if (IsClosed()) {</span>
+      return;
+   }
+
+<span style = "background-color:#fdd">   if (e) {</span>
+      LOG_WARN(mLog, "Connection %p (#%d): Sending error code failed, "
+               "code: %d [%s: %s]. Closing connection.",
+               this, mConnectionCount,
+<span style = "background-color:#fdd">               e.value(), e.category().name(), e.message().c_str());
+   } else {</span>
+      LOG_WARN(mLog, "Connection %p (#%d): Sending error code succeeded. "
+               "Closing connection.",
+<span style = "background-color:#fdd">               this, mConnectionCount);</span>
+      // Initiate graceful connection closure.
+<span style = "background-color:#fdd">      boost::system::error_code ignored_ec;</span>
+      GetSocket().shutdown(boost::asio::ip::tcp::socket::shutdown_both,
+<span style = "background-color:#fdd">                           ignored_ec);</span>
+   }
+
+<span style = "background-color:#fdd">   Close();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::CreateClientRequest
+ *
+ *    Creates a ClientRequest object for Blast.
+ *
+ *    The caller is responsible for deleting the returned ClientRequest.
+ *
+ * Results:
+ *    Returns a newly constructed ClientRequest object.
+ *
+ * Side Effects:
+ *    If the resetRequest parameter is true, this method replaces the current
+ *    Request object referred to by the Connection's mRequest member with
+ *    a fresh new Request in anticipation of future activity.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+ClientRequest*
+Connection::CreateClientRequest(bool resetRequest)    // IN
+<span style = "background-color:#fdd">{
+   boost::system::error_code ec;
+   boost::asio::ip::tcp::endpoint endpoint = GetSocket().remote_endpoint(ec);
+   if (ec) {</span>
+      LOG_ERROR(mLog, "Connection %p: "
+                "Error retrieving endpoint from socket, code: %d [%s: %s]",
+<span style = "background-color:#fdd">                this, ec.value(), ec.category().name(), ec.message().c_str());
+      return NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   string clientIp = endpoint.address().to_string();</span>
+
+<span style = "background-color:#fdd">   std::ostringstream localEndpoint;
+   localEndpoint &lt;&lt; GetSocket().local_endpoint();</span>
+
+<span style = "background-color:#fdd">   string url = "https://" + localEndpoint.str() + mRequest-&gt;mUri;</span>
+
+<span style = "background-color:#fdd">   string cookie = mRequest-&gt;GetHeaderValue("cookie");</span>
+   string sessionCookie =
+<span style = "background-color:#fdd">      AbUtil::GetSessionCookieFromHeaderString(cookie);</span>
+
+   ClientRequest::HttpVerb httpVerb = ClientRequest::UNSUPPORTED;
+<span style = "background-color:#fdd">   if (mRequest-&gt;mMethod == Request::GET) {
+      httpVerb = ClientRequest::GET;
+   } else if (mRequest-&gt;mMethod == Request::POST) {
+      httpVerb = ClientRequest::POST;
+   } else if (mRequest-&gt;mMethod == Request::PUT) {</span>
+      httpVerb = ClientRequest::PUT;
+   }
+
+   IHttpResponse* response = new Response(shared_from_this(),
+<span style = "background-color:#fdd">                                          mIsSsl);</span>
+
+   ClientRequest* cp = new ClientRequest(response,
+                                         clientIp,
+                                         url,
+                                         sessionCookie,
+                                         httpVerb,
+                                         mAuthenticateMgr,
+<span style = "background-color:#fdd">                                         mRequest);</span>
+
+<span style = "background-color:#fdd">   if (resetRequest) {</span>
+      // Discard the current Request and line up a fresh new one
+<span style = "background-color:#fdd">      mRequest.reset(new Request());</span>
+   }
+
+<span style = "background-color:#fdd">   return cp;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::SendResponse
+ *
+ *    Called to send an HTTP response.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::SendResponse(Response&amp; response) // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock lock(mLock);</span>
+
+<span style = "background-color:#fdd">   ASSERT(mResponseData == NULL);</span>
+   std::vector&lt;boost::asio::const_buffer&gt; buffers =
+<span style = "background-color:#fdd">      response.Serialize(mResponseData);</span>
+
+<span style = "background-color:#fdd">   IHttpResponse::HttpStatusCode status = response.GetStatusCode();</span>
+
+   // Disconnect after sending a response in the 4xx-5xx range.
+   mDisconnectOnWrite =
+      (status &gt;= IHttpResponse::BAD_REQUEST &amp;&amp;
+<span style = "background-color:#fdd">       status &lt;= IHttpResponse::NOT_IMPLEMENTED);</span>
+
+<span style = "background-color:#fdd">   HTTP2_CONN_PICK_WRITE(&amp;Connection::OnWriteResponse, buffers);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::OnWriteResponse
+ *
+ *    Write callback used when writing back the HTTP response headers.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::OnWriteResponse(const boost::system::error_code&amp; e, // IN
+                            std::size_t bytesXferred)           // IN
+<span style = "background-color:#fdd">{
+   if (IsClosed()) {</span>
+      return;
+   }
+
+<span style = "background-color:#fdd">   boost::recursive_mutex::scoped_lock lock(mLock);</span>
+
+   // See comment in Response::Serialize().
+<span style = "background-color:#fdd">   if (mResponseData) {
+      delete static_cast&lt;Response::Data*&gt;(mResponseData);
+      mResponseData = NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   if (!e &amp;&amp; !mDisconnectOnWrite) {
+      if (mIsWebSocket) {</span>
+         // Create a new WebSocket after this HTTP acknowledgement has been sent.
+<span style = "background-color:#fdd">         std::ostringstream localEndpoint;
+         localEndpoint &lt;&lt; GetSocket().local_endpoint();</span>
+
+         mSavedUrl = string(mIsSsl ? "wss://" : "ws://") +
+<span style = "background-color:#fdd">            localEndpoint.str() + mRequest-&gt;mUri;</span>
+
+         // Now create the websocket and hand it off to the websocket sink
+<span style = "background-color:#fdd">         http2::IWebSocket* ws = CreateWebSocket();
+         LOG_INFO(mLog, "Connection %p: WebSocket %p created.", this, ws);</span>
+
+<span style = "background-color:#fdd">         if (mDispatcher) {</span>
+            /*
+             * If not UDP, proceed as usual. Otherwise, we need to determine
+             * whether this is a secondary connection. Depending on that, and
+             * depending on whether UDP headers were found, we can take the
+             * required action.
+             */
+<span style = "background-color:#fdd">            if (!mUdpEnabled) {</span>
+               ClientConnectionInfo clientConnectionInfo;
+<span style = "background-color:#fdd">               ws-&gt;GetClientConnectionInfo(clientConnectionInfo);</span>
+               LOG_INFO(mLog, "Client Connection Information: UserConfig = %d"
+                        ", Broker Connection = %d, Primary Connection = %d",
+                        clientConnectionInfo.userConfigMode,
+                        clientConnectionInfo.brokerProtocol,
+<span style = "background-color:#fdd">                        clientConnectionInfo.primaryProtocol);</span>
+               if ((clientConnectionInfo.userConfigMode ==
+                     BLAST_SERVICE_USER_MODE_UDP_ONLY) &amp;&amp;
+                   (clientConnectionInfo.primaryProtocol ==
+<span style = "background-color:#fdd">                     BLAST_SERVICE_PROTOCOL_UDP)) {</span>
+                  /*
+                   * UDP is disabled and we have UDP-only mode. In this case,
+                   * the client will re-start the primary over TCP. Given that
+                   * we expect a re-started primary connection to come in, we
+                   * could just close the websocket here. However, that might
+                   * cause issues on the client, since the client expects to
+                   * be the one to initiate the close. So to avoid that, just
+                   * queue up a dummy read here, which should keep the
+                   * reference alive. When the read errors out, the websocket
+                   * reference will drop and the object should get freed.
+                   */
+                  LOG_DEBUG(mLog, "Connection %p: UDP Only mode with UDP disabled %p.",
+<span style = "background-color:#fdd">                            this, ws);
+                  boost::shared_ptr&lt;http2::IWebSocket&gt; tempWS(ws);
+                  tempWS-&gt;DummyWaitForData();
+               } else {
+                  mDispatcher-&gt;Push(ws);</span>
+                  LOG_DEBUG(mLog, "Connection %p: Finished pushing WebSocket %p.",
+<span style = "background-color:#fdd">                            this, ws);</span>
+               }
+<span style = "background-color:#fdd">            } else {</span>
+               /*
+                * If UDP headers are not present, then it is as good as UDP
+                * being disabled. So just push the websocket.
+                */
+<span style = "background-color:#fdd">               if (!mUdpHeadersPresent) {
+                  mDispatcher-&gt;Push(ws);</span>
+                  LOG_DEBUG(mLog, "Connection %p: Finished pushing primary "
+<span style = "background-color:#fdd">                            "websocket %p, no UDP headers.", this, ws);</span>
+               }
+
+               /*
+                * If UDP headers are present, then we need to save the
+                * websocket to a map in the dispatcher, for future use.
+                */
+<span style = "background-color:#fdd">               if (mUdpHeadersPresent) {</span>
+                  LOG_DEBUG(mLog, "Primary websocket %p, UDP headers present",
+<span style = "background-color:#fdd">                            ws);
+                  mDispatcher-&gt;UpdatePrimaryWebSocketMap(ws);</span>
+               }
+            }
+<span style = "background-color:#fdd">         } else {
+            LOG_FATAL(mLog, "Request dispatcher is not initialized");</span>
+         }
+<span style = "background-color:#fdd">      } else {</span>
+         // Read the next request.
+<span style = "background-color:#fdd">         StartIdleTimer();
+         HTTP2_CONN_PICK_READ(&amp;Connection::OnReadRequest);
+         return;</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   if (e || mDisconnectOnWrite) {
+      Close();</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::CreateClientUpgradeRequest
+ *
+ *    Creates a request object representing a WebSocket upgrade request, to
+ *    be processed by the Dispatcher's AuthenticateRequest method.
+ *
+ *    For now this is just a wrapper around CreateClientRequest and
+ *    therefore it returns a pointer to a ClientRequest.  However, if it
+ *    turns out that WebSocket upgrade requests need handling that can't be
+ *    accommodated by common code in CreateClientRequest then this function
+ *    would be the place to make the necessary adjustments.  (In the
+ *    extreme, this function could return a unique object type to be used
+ *    for upgrade validation.)
+ *
+ *    The caller is responsible for delete'ing the returned ClientRequest.
+ *
+ * Results:
+ *    Returns a pointer to an instance of ClientRequest.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+ClientRequest *
+Connection::CreateClientUpgradeRequest()
+{
+   /*
+    * Tell CreateClientRequest to retain the original Request, because the
+    * handler for the WebSocket will eventually want to extract additional
+    * information from it.
+    */
+
+   return CreateClientRequest(false);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::IsWSUpgradeRequest
+ *
+ *    Check if this is a web socket upgrade request
+ *
+ * Results:
+ *    Returns true if it is a websocket upgrade request, false otherwise
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Connection::IsWSUpgradeRequest()
+<span style = "background-color:#fdd">{</span>
+   LOG_INFO(mLog, "Connection %p (#%d) checking for WebSocket upgrade "
+<span style = "background-color:#fdd">            "request.", this, mConnectionCount);</span>
+
+<span style = "background-color:#fdd">   __int64 startTime = AbUtil::GetClock64();</span>
+
+<span style = "background-color:#fdd">   string upgrade = mRequest-&gt;GetHeaderValue("upgrade");
+   string connection = mRequest-&gt;GetHeaderValue("connection");
+   string key = mRequest-&gt;GetHeaderValue("sec-websocket-key");
+   string subproto = mRequest-&gt;GetHeaderValue("sec-websocket-protocol");
+   string verStr = mRequest-&gt;GetHeaderValue("sec-websocket-version");
+   int version = atoi(verStr.c_str());</span>
+
+   LOG_DEBUG(mLog, "Connection %p (#%d) checking for WebSocket upgrade "
+             "request: version:%d, subprotocol:'%s', key:%s, upgrade:%s, "
+             "connection:%s, URL:'%s'.", this, mConnectionCount,
+             version, subproto.c_str(), Log_Token(key).c_str(),
+             upgrade.c_str(), connection.c_str(),
+<span style = "background-color:#fdd">             AbUtil::RedactUrlQueryString(mRequest-&gt;mUri).c_str());</span>
+
+   if (version &lt; 0 ||
+       key.empty() ||
+       subproto.empty() ||
+       stricmp(upgrade.c_str(), "websocket") ||
+       (connection.find("upgrade") == string::npos &amp;&amp;
+<span style = "background-color:#fdd">        connection.find("Upgrade") == string::npos)) {</span>
+      LOG_ERROR(mLog, "Connection %p (#%d) invalid upgrade request.",
+<span style = "background-color:#fdd">                this, mConnectionCount);
+      return false;</span>
+   }
+
+   LOG_INFO(mLog, "Connection %p (#%d) received WebSocket upgrade request.",
+<span style = "background-color:#fdd">            this, mConnectionCount);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::HandleUpgradeRequest
+ *
+ *    Called to handle client's upgrade (to websocket) request
+ *
+ * Results:
+ *    Returns true if upgrade request is accepted, false otherwise
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Connection::HandleUpgradeRequest()
+<span style = "background-color:#fdd">{</span>
+   LOG_INFO(mLog, "Connection %p (#%d) handling upgrade request. "
+            "UDP path is %s.",
+<span style = "background-color:#fdd">            this, mConnectionCount, mUdpEnabled ? "enabled" : "disabled");</span>
+
+<span style = "background-color:#fdd">   __int64 startTime = AbUtil::GetClock64();</span>
+
+<span style = "background-color:#fdd">   mSavedCookie.clear();      // see: RB#744829
+   mSubprotocol.clear();</span>
+
+<span style = "background-color:#fdd">   bool enableVVC = false;
+   PersistentConfig* config = MainAppService::Get()-&gt;GetConfig();
+   config-&gt;GetBool(CONFIG_ENABLE_VVC, enableVVC);
+   InitSubProtocolMap(enableVVC);</span>
+
+<span style = "background-color:#fdd">   ClientRequest *cUpgradeReq = CreateClientUpgradeRequest();
+   if (!cUpgradeReq) {</span>
+      LOG_ERROR(mLog, "NULL return from CreateClientUpgradeRequest (%I64d ms)",
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      SendError(IHttpResponse::INTERNAL_SERVER_ERROR);
+      return false;</span>
+   }
+
+   IHttpResponse::HttpStatusCode retVal =
+      mDispatcher-&gt;HandleWebSocketUpgrade(cUpgradeReq, mUdpEnabled,
+                                          mUdpIpAddr, mUdpPort,
+                                          mSavedCookie,
+                                          mSubprotocol, mVAuth,
+                                          mUdpHeadersPresent,
+<span style = "background-color:#fdd">                                          mClientConnectionInfo);</span>
+
+   LOG_DEBUG(mLog, "WebSocket upgrade handled, UDP support is %s, "
+             "UDP Headers are%s present",
+             mUdpEnabled ? "enabled" : "disabled",
+<span style = "background-color:#fdd">             mUdpHeadersPresent ? "" : " not");</span>
+   LOG_DEBUG(mLog, "userConfigMode = %d, broker = %d and primary = %d, ",
+             mClientConnectionInfo.userConfigMode,
+             mClientConnectionInfo.brokerProtocol,
+<span style = "background-color:#fdd">             mClientConnectionInfo.primaryProtocol);</span>
+
+<span style = "background-color:#fdd">   if (retVal == IHttpResponse::OK) {
+      Response *response = static_cast&lt;Response *&gt;(cUpgradeReq-&gt;GetResponse());
+      if (response == NULL) {
+         SendError(IHttpResponse::INTERNAL_SERVER_ERROR);</span>
+         LOG_ERROR(mLog, "NULL return from CreateClientUpgradeRequest "
+<span style = "background-color:#fdd">                   "(%I64d ms)", AbUtil::GetClock64() - startTime);
+      } else {
+         mIsWebSocket = true;
+         response-&gt;RespondWithText(IHttpResponse::SWITCHING_PROTOCOLS, "", "");
+         retVal = IHttpResponse::OK;</span>
+         LOG_INFO(mLog, "Connection %p upgraded to WebSocket, vauth %s "
+                  "(%I64d ms)", this, Log_Token(mVAuth).c_str(),
+<span style = "background-color:#fdd">                  AbUtil::GetClock64() - startTime);</span>
+      }
+<span style = "background-color:#fdd">   } else {
+      SendError(retVal);</span>
+      LOG_ERROR(mLog, "Connection %p failed to WebSocket upgrade, vauth %s "
+                "code %d (%I64d ms)", this, Log_Token(mVAuth).c_str(), retVal,
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);</span>
+   }
+
+<span style = "background-color:#fdd">   delete cUpgradeReq;</span>
+
+   /*
+    * We'll allow the new higher-level protocol to enforce any timeout.
+    * We also probably shouldn't cancel the idle timer (below) when
+    * this failure happens, but again that's the historical behaviour
+    * so I'm leaving it as-is.  TODO
+    */
+<span style = "background-color:#fdd">   CancelIdleTimer();</span>
+
+<span style = "background-color:#fdd">   return (retVal == IHttpResponse::OK);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetClientConnectionInfo
+ *
+ *    Get client connection information.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::GetClientConnectionInfo(
+                               ClientConnectionInfo&amp; clientConnectionInfo) const
+<span style = "background-color:#fdd">{
+   clientConnectionInfo = mClientConnectionInfo;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::StartIdleTimer
+ *
+ *    Called to start the HTTP request idle timer.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::StartIdleTimer()
+<span style = "background-color:#fdd">{
+   boost::system::error_code ignored_ec;</span>
+   mIdleTimer.expires_from_now(boost::posix_time::seconds(HTTP_MAX_IDLE_SECS),
+<span style = "background-color:#fdd">                               ignored_ec);</span>
+   mIdleTimer.async_wait(boost::bind(&amp;Connection::OnIdleTimerCheck,
+                                     shared_from_this(),
+<span style = "background-color:#fdd">                                     boost::asio::placeholders::error));
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::CancelIdleTimer
+ *
+ *    Called to cancel the HTTP request idle timer.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::CancelIdleTimer()
+<span style = "background-color:#fdd">{
+   boost::system::error_code ignored_ec;
+   mIdleTimer.cancel(ignored_ec);
+   mIdleTimer.expires_from_now(boost::posix_time::pos_infin, ignored_ec);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::OnIdleTimerCheck
+ *
+ *    Called to check the HTTP request idle timer.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::OnIdleTimerCheck(const boost::system::error_code&amp; e)
+<span style = "background-color:#fdd">{
+   if (e == boost::asio::error::operation_aborted || IsClosed()) {</span>
+      return;
+   }
+
+   /*
+    * Check whether the deadline has passed. We compare the deadline against
+    * the current time since a new asynchronous operation may have moved the
+    * deadline before this actor had a chance to run.
+    */
+   if (mIdleTimer.expires_at() &lt;=
+<span style = "background-color:#fdd">       boost::asio::deadline_timer::traits_type::now()) {</span>
+      LOG_DEBUG(mLog, "Connection %p is idle for %d seconds. Closing.",
+<span style = "background-color:#fdd">                this, HTTP_MAX_IDLE_SECS);
+      Close();
+   } else {</span>
+      // Wait again.
+      mIdleTimer.async_wait(boost::bind(&amp;Connection::OnIdleTimerCheck,
+                                        shared_from_this(),
+<span style = "background-color:#fdd">                                        boost::asio::placeholders::error));</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::Close
+ *
+ *    Called to close the connection.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::Close()
+<span style = "background-color:#fdd">{
+   LOG_INFO(mLog, "Connection %p (#%d)", this, mConnectionCount);</span>
+
+<span style = "background-color:#fdd">   boost::system::error_code ignored_ec;
+   CancelIdleTimer();
+   GetSocket().close(ignored_ec);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetRemoteAddr
+ *
+ *    Get the remote (destination) address in network byte order.
+ *
+ * Results:
+ *    Returns the remote IP address in network byte-order.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+unsigned long
+Connection::GetRemoteAddr() const
+<span style = "background-color:#fdd">{
+   boost::asio::ip::tcp::endpoint ep = GetSocket().remote_endpoint();
+   if (!ep.address().is_v4()) {</span>
+      // XXX Todo: support IPv6.
+<span style = "background-color:#fdd">      return 0;</span>
+   }
+
+<span style = "background-color:#fdd">   unsigned long ip = htonl(ep.address().to_v4().to_ulong());
+   return ip;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetRemotePort
+ *
+ *    Get the remote (destination) port in network byte order.
+ *
+ * Results:
+ *    Returns the remote port in network byte-order.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+unsigned short
+Connection::GetRemotePort() const
+<span style = "background-color:#fdd">{
+   boost::asio::ip::tcp::endpoint ep = GetSocket().remote_endpoint();
+   unsigned short port = htons(ep.port());</span>
+   return port;
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetLocalAddr
+ *
+ *    Get the local (source) address in network byte order.
+ *
+ * Results:
+ *    Returns the local IP address in network byte-order.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+unsigned long
+Connection::GetLocalAddr() const
+<span style = "background-color:#fdd">{
+   boost::asio::ip::tcp::endpoint ep = GetSocket().local_endpoint();
+   if (!ep.address().is_v4()) {</span>
+      // XXX Todo: support IPv6.
+<span style = "background-color:#fdd">      return 0;</span>
+   }
+
+<span style = "background-color:#fdd">   unsigned long ip = htonl(ep.address().to_v4().to_ulong());
+   return ip;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetLocalPort
+ *
+ *    Get the local (source) port in network byte order.
+ *
+ * Results:
+ *    Returns the local port in network byte-order.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+unsigned short
+Connection::GetLocalPort() const
+<span style = "background-color:#fdd">{
+   boost::asio::ip::tcp::endpoint ep = GetSocket().local_endpoint();
+   unsigned short port = htons(ep.port());</span>
+   return port;
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetTcpTableEntry
+ *
+ *    Get the PMIB_TCPROW for the connection.
+ *
+ * Results:
+ *    Returns the PMIB_TCPROW associated with the connection or NULL.
+ *    If non-NULL the "table" argument needs to be freed after use.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+PMIB_TCPROW
+Connection::GetTcpTableEntry(PMIB_TCPTABLE&amp; table) const
+<span style = "background-color:#fdd">{
+   table = (MIB_TCPTABLE*)malloc(sizeof(MIB_TCPTABLE));
+   if (table == NULL) {</span>
+      return NULL;
+   }
+
+<span style = "background-color:#fdd">   DWORD size = sizeof(MIB_TCPTABLE);
+   DWORD ret = MyGetTcpTable(table, &amp;size, TRUE);
+   if (ret == ERROR_INSUFFICIENT_BUFFER) {
+      free(table);
+      table = (MIB_TCPTABLE*)malloc(size);
+      if (table == NULL) {</span>
+         return NULL;
+      }
+   }
+
+<span style = "background-color:#fdd">   ret = MyGetTcpTable(table, &amp;size, TRUE);
+   if (ret != NO_ERROR) {
+      LOG_WARN(mLog, "GetTcpTable failed with: %ld", ret);
+      free(table);
+      table = NULL;
+      return NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   unsigned long dstAddr = GetRemoteAddr();
+   unsigned short dstPort = GetRemotePort();</span>
+
+<span style = "background-color:#fdd">   unsigned long srcAddr = GetLocalAddr();
+   unsigned short srcPort = GetLocalPort();</span>
+
+<span style = "background-color:#fdd">   for (size_t i = 0; i &lt; table-&gt;dwNumEntries; ++i) {</span>
+      if (dstPort == table-&gt;table[i].dwRemotePort &amp;&amp;
+          dstAddr == table-&gt;table[i].dwRemoteAddr &amp;&amp;
+          srcPort == table-&gt;table[i].dwLocalPort &amp;&amp;
+<span style = "background-color:#fdd">          srcAddr == table-&gt;table[i].dwLocalAddr) {</span>
+         // The user needs to free the table when they're done.
+<span style = "background-color:#fdd">         return &amp;table-&gt;table[i];</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   if (table != NULL) {
+      free(table);
+      table = NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   return NULL;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::EnableStatistics
+ *
+ *    Enable statistics collection for the connection.
+ *
+ * Results:
+ *    Returns true if successful.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Connection::EnableStatistics()
+<span style = "background-color:#fdd">{
+   mStatsEnabled = false;</span>
+
+<span style = "background-color:#fdd">   if (!mIphlpapiDLL) {
+      boost::mutex::scoped_lock guard(mIphlpapiLock);
+      if (!mIphlpapiDLL &amp;&amp; !LoadIphlpapi()) {
+         LOG_DEBUG(mLog, "Unable to load Iphlpapi.dll functions.");
+         return false;</span>
+      }
+<span style = "background-color:#fdd">   }</span>
+
+   PMIB_TCPTABLE table;
+<span style = "background-color:#fdd">   PMIB_TCPROW row = GetTcpTableEntry(table);
+   if (!row) {
+      LOG_DEBUG(mLog, "Unable to get TCP table entry.");
+      return false;</span>
+   }
+
+   TCP_ESTATS_BANDWIDTH_RW_v0 bwRw;
+<span style = "background-color:#fdd">   bwRw.EnableCollectionInbound = TcpBoolOptEnabled;
+   bwRw.EnableCollectionOutbound= TcpBoolOptEnabled;</span>
+
+   TCP_ESTATS_SEND_BUFF_RW_v0 sbRw;
+<span style = "background-color:#fdd">   sbRw.EnableCollection = true;</span>
+
+   TCP_ESTATS_PATH_RW_v0 pathRw;
+<span style = "background-color:#fdd">   pathRw.EnableCollection = true;</span>
+
+   ULONG ret = MySetPerTcpConnectionEStats(row,
+                                           TcpConnectionEstatsBandwidth,
+                                           (PUCHAR)&amp;bwRw,
+                                           0,
+                                           sizeof(bwRw),
+<span style = "background-color:#fdd">                                           0);
+   if (ret != NO_ERROR) {</span>
+      LOG_DEBUG(mLog, "Unable to enable bandwidth stats collection: %ld",
+<span style = "background-color:#fdd">                ret);
+      free(table);
+      return false;</span>
+   }
+
+   ret = MySetPerTcpConnectionEStats(row,
+                                     TcpConnectionEstatsSendBuff,
+                                     (PUCHAR)&amp;sbRw,
+                                     0,
+                                     sizeof(sbRw),
+<span style = "background-color:#fdd">                                     0);
+   if (ret != NO_ERROR) {</span>
+      LOG_DEBUG(mLog, "Unable to enable sendbuff stats collection: %ld",
+<span style = "background-color:#fdd">                ret);
+      free(table);
+      return false;</span>
+   }
+
+   ret = MySetPerTcpConnectionEStats(row,
+                                     TcpConnectionEstatsPath,
+                                     (PUCHAR)&amp;pathRw,
+                                     0,
+                                     sizeof(pathRw),
+<span style = "background-color:#fdd">                                     0);
+   if (ret != NO_ERROR) {</span>
+      LOG_DEBUG(mLog, "Unable to enable path stats collection: %ld",
+<span style = "background-color:#fdd">                ret);
+      free(table);
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   mStatsEnabled = true;
+   free(table);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetStatistics
+ *
+ *    Get connection statistics from the OS.
+ *
+ * Results:
+ *    Returns true if successful and "stats" is populated.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Connection::GetStatistics(Statistics&amp; stats) const
+<span style = "background-color:#fdd">{
+   if (!mStatsEnabled) {
+      return false;</span>
+   }
+
+   PMIB_TCPTABLE table;
+<span style = "background-color:#fdd">   PMIB_TCPROW row = GetTcpTableEntry(table);
+   if (!row) {
+      LOG_DEBUG(mLog, "Unable to get TCP table entry.");
+      return false;</span>
+   }
+
+   ULONG ret = MyGetPerTcpConnectionEStats(row,
+                                           TcpConnectionEstatsBandwidth,
+                                           NULL,
+                                           0,
+                                           0,
+                                           NULL,
+                                           0,
+                                           0,
+                                           (PUCHAR)&amp;stats.bwStats,
+                                           0,
+<span style = "background-color:#fdd">                                           sizeof(stats.bwStats));
+   if (ret != NO_ERROR) {
+      LOG_DEBUG(mLog, "Error getting bandwidth stats: %ld", ret);
+      free(table);
+      return false;</span>
+   }
+
+   ret = MyGetPerTcpConnectionEStats(row,
+                                     TcpConnectionEstatsSendBuff,
+                                     NULL,
+                                     0,
+                                     0,
+                                     NULL,
+                                     0,
+                                     0,
+                                     (PUCHAR)&amp;stats.sbStats,
+                                     0,
+<span style = "background-color:#fdd">                                     sizeof(stats.sbStats));</span>
+
+<span style = "background-color:#fdd">   if (ret != NO_ERROR) {
+      LOG_DEBUG(mLog, "Error getting sendbuff stats: %ld", ret);
+      free(table);
+      return false;</span>
+   }
+
+   ret = MyGetPerTcpConnectionEStats(row,
+                                     TcpConnectionEstatsPath,
+                                     NULL,
+                                     0,
+                                     0,
+                                     NULL,
+                                     0,
+                                     0,
+                                     (PUCHAR)&amp;stats.pathStats,
+                                     0,
+<span style = "background-color:#fdd">                                     sizeof(stats.pathStats));</span>
+
+<span style = "background-color:#fdd">   if (ret != NO_ERROR) {
+      LOG_DEBUG(mLog, "Error getting path stats: %ld", ret);
+      free(table);
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   free(table);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::CreateWebSocket
+ *
+ *    Create a new websocket object to wrap around the current connection
+ *
+ * Results:
+ *    WebSocket object.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+http2::IWebSocket*
+Connection::CreateWebSocket()
+<span style = "background-color:#fdd">{</span>
+   LOG_INFO(mLog, "Connection %p (#%d): Creating WebSocket, subProtocol:%s.",
+<span style = "background-color:#fdd">            this, mConnectionCount, mSubprotocol.c_str());
+   const ISubprotocol* subproto = http2::GetSubProtocol(mSubprotocol);
+   if (subproto == NULL) {
+      LOG_ERROR(mLog, "Connection %p: SubProtocol interface is NULL.", this);
+      return NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   http2::WebSocket *ws = NULL;</span>
+   try {
+      ws = new http2::WebSocket(mSavedUrl,
+                  mSavedCookie,
+                  *subproto,
+                  shared_from_this(),
+                  mIOService,
+<span style = "background-color:#fdd">                  mIsSsl);</span>
+      LOG_DEBUG(mLog, "Connection %p: WebSocket %p allocated.",
+<span style = "background-color:#fdd">                this, ws);
+   } catch (std::exception &amp;e) {</span>
+      LOG_ERROR(mLog, "Connection %p: Could not instantiate websocket: %s.",
+<span style = "background-color:#fdd">                this, e.what());
+   }</span>
+
+<span style = "background-color:#fdd">   return ws;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::IsClosed
+ *
+ *    Check whether this connection is closed.
+ *
+ * Results:
+ *    true if it is closed, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Connection::IsClosed() const
+{
+   return !GetSocket().is_open();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::IsWebSocket
+ *
+ *    Check whether this connection is a websocket connection
+ *
+ * Results:
+ *    true if it is a websocket connection, false otherwise
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Connection::IsWebSocket() const
+<span style = "background-color:#fdd">{
+   return mIsWebSocket;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetSocket
+ *
+ *    Get the underlying socket associated with this connection.
+ *
+ * Results:
+ *    Underlying socket.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+SSLSocket::lowest_layer_type&amp;
+Connection::GetSocket()
+<span style = "background-color:#fdd">{
+   return mSocket.lowest_layer();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetSocket
+ *
+ *    Get the underlying socket associated with this connection.
+ *
+ * Results:
+ *    Underlying socket.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+const SSLSocket::lowest_layer_type&amp;
+Connection::GetSocket() const
+{
+   return mSocket.lowest_layer();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetSSLSocket
+ *
+ *    Get the underlying SSLSocket object associated with the connection.
+ *
+ * Results:
+ *    Underlying SSLSocket.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+SSLSocket&amp;
+Connection::GetSSLSocket()
+<span style = "background-color:#fdd">{
+   return mSocket;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetSSLSocket
+ *
+ *    Get the underlying SSLSocket object associated with the connection.
+ *
+ * Results:
+ *    Underlying SSLSocket.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+const SSLSocket&amp;
+Connection::GetSSLSocket() const
+{
+   return mSocket;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetTCPSocket
+ *
+ *    Get the underlying TCP socket object associated with the connection.
+ *
+ * Results:
+ *    Underlying TCP Socket.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+TCPSocket&amp;
+Connection::GetTCPSocket()
+<span style = "background-color:#fdd">{
+   return mSocket.next_layer();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetTCPSocket
+ *
+ *    Get the underlying TCP socket object associated with the connection.
+ *
+ * Results:
+ *    Underlying TCP Socket.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+const TCPSocket&amp;
+Connection::GetTCPSocket() const
+{
+   return mSocket.next_layer();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::SetSubProtocol
+ *
+ *    Set the sub-protocol that is being used.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::SetSubProtocol(std::string subProtocol)   // IN
+<span style = "background-color:#fdd">{
+   mSubprotocol = subProtocol;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetSubProtocol
+ *
+ *    Get the sub-protocol that is being used.
+ *
+ * Results:
+ *    Sub-protocol string.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+Connection::GetSubProtocol()
+<span style = "background-color:#fdd">{
+   return mSubprotocol;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::GetVAuth
+ *
+ *    Return the vAuth token associated with this connection object.
+ *
+ * Results:
+ *    vAuth token.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+Connection::GetVAuth()
+<span style = "background-color:#fdd">{
+   return mVAuth;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::NotifyDataAvailable
+ *
+ *    Notify the dispatcher that data is available.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Connection::NotifyDataAvailable(boost::shared_ptr&lt;http2::IWebSocket&gt; ws)
+<span style = "background-color:#fdd">{
+   mDispatcher-&gt;NotifyDataAvailable(ws);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Connection::LoadIphlpapi
+ *
+ *    Dynamically load what we need from Iphlpapi.dll
+ *
+ * Results:
+ *    Returns true if we successfully loaded the functions we need.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Connection::LoadIphlpapi()
+<span style = "background-color:#fdd">{
+   if (mIphlpapiDLL) {
+      return true;</span>
+   }
+
+<span style = "background-color:#fdd">   mIphlpapiDLL = LoadLibrary(L"iphlpapi.dll");
+   if (!mIphlpapiDLL) {
+      LOG_ERROR(mLog, "Unable to load iphlpapi.dll.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   MyGetTcpTable = (GetTcpTableFunction*)GetProcAddress(mIphlpapiDLL, "GetTcpTable");
+   if (!MyGetTcpTable) {</span>
+      LOG_ERROR(mLog, "Unable to load GetTcpTable function, error:0x%08lx.",
+<span style = "background-color:#fdd">                GetLastError());
+      goto error;</span>
+   }
+
+   MyGetPerTcpConnectionEStats =
+<span style = "background-color:#fdd">      (GetPerTcpConnectionEStatsFunction*)GetProcAddress(mIphlpapiDLL, "GetPerTcpConnectionEStats");
+   if (!MyGetPerTcpConnectionEStats) {</span>
+      LOG_ERROR(mLog, "Unable to load GetPerTcpConnectionEStats function, "
+<span style = "background-color:#fdd">                "error:0x%08lx.", GetLastError());
+      goto error;</span>
+   }
+
+   MySetPerTcpConnectionEStats =
+<span style = "background-color:#fdd">      (SetPerTcpConnectionEStatsFunction*)GetProcAddress(mIphlpapiDLL, "SetPerTcpConnectionEStats");
+   if (!MySetPerTcpConnectionEStats) {</span>
+      LOG_ERROR(mLog, "Unable to load SetPerTcpConnectionEStats function, "
+<span style = "background-color:#fdd">                "error:0x%08lx.", GetLastError());</span>
+      goto error;
+   }
+
+<span style = "background-color:#fdd">   return true;</span>
+
+error:
+<span style = "background-color:#fdd">   FreeLibrary(mIphlpapiDLL);
+   mIphlpapiDLL = NULL;</span>
+
+<span style = "background-color:#fdd">   return false;
+}</span>
+
+} // namespace http2</pre>
+	</body>
+</html>

@@ -1,0 +1,120 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>createprocesswithtoken.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Some parts of this file (c) 2012, 2014-2015 VMware, Inc.  All rights reserved.
+ * -- VMware Confidential
+ *
+ * Some parts originate from launch_process_with_token.cc from Chromium,
+ * taken from their Git repository at commit cd1d752b on 10/24/12.
+ * The code was readapted to fit VMware coding style and to coexist
+ * with Blast without needing to port various helper functions from Chromium.
+ * That code falls under the following original license, allowing modification:
+ *
+ * Copyright (c) 2012 The Chromium Authors. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are
+ * met:
+ *
+ *    * Redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer.
+ *    * Redistributions in binary form must reproduce the above
+ * copyright notice, this list of conditions and the following disclaimer
+ * in the documentation and/or other materials provided with the
+ * distribution.
+ *    * Neither the name of Google Inc. nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * **********************************************************/
+
+#include &lt;string&gt;
+#include &lt;limits&gt;
+#include &lt;vector&gt;
+
+#include &lt;windows.h&gt;
+#include &lt;sddl.h&gt;
+#include &lt;winternl.h&gt;
+
+// appblast/common
+#include "appBlastUtil.h"
+#include "Logging.h"
+
+// naughty strsafe comes last
+#include &lt;strsafe.h&gt;
+
+using std::wstring;
+using std::string;
+
+const wchar_t INTERACTIVE_DESKTOP_NAME[] = L"winsta0\\Default";
+
+<span style = "background-color:#dfd">const string MAIN_APP_LOG_NAME = "main";</span>
+#define DEFINE_LOGGER log4cxx::LoggerPtr LOG = log4cxx::Logger::getLogger(MAIN_APP_LOG_NAME)
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CreateProcessWithToken --
+ *
+ *    Creates a given process with the same arguments as CreateProcessAsUser.
+ *
+ * Results:
+ *    true if the process was created false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+CreateProcessWithToken(const wstring&amp; appName,     // IN
+                       const wstring&amp; commandLine, // IN
+                       HANDLE userToken,           // IN
+                       bool inheritHandles,        // IN
+                       DWORD creationFlags,        // IN
+                       PROCESS_INFORMATION *pi)    // OUT
+<span style = "background-color:#fdd">{</span>
+   STARTUPINFOW si;
+<span style = "background-color:#fdd">   DEFINE_LOGGER;</span>
+
+<span style = "background-color:#fdd">   memset(&amp;si, 0, sizeof(si));
+   si.cb = sizeof(si);
+   si.lpDesktop = _wcsdup(INTERACTIVE_DESKTOP_NAME);</span>
+
+   BOOL result = CreateProcessAsUser(userToken,
+                                     appName.c_str(),
+                                     const_cast&lt;LPWSTR&gt;(commandLine.c_str()),
+                                     NULL, NULL, inheritHandles, creationFlags,
+<span style = "background-color:#fdd">                                     NULL, NULL, &amp;si, pi);</span>
+
+<span style = "background-color:#fdd">   free(si.lpDesktop);
+   si.lpDesktop = NULL;</span>
+
+<span style = "background-color:#fdd">   if (!result) {</span>
+      LOG_ERROR(LOG, "Failed to launch a process with a user token, "
+<span style = "background-color:#fdd">                "error:0x%08lx.", GetLastError());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return true;
+}</span></pre>
+	</body>
+</html>

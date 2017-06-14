@@ -1,0 +1,13 @@
+clang==4.0.post1
+gitdb2==2.0.2
+GitPython==2.1.3
+javalang==0.11.0
+lxml==3.7.3
+mysqlclient==1.3.10
+nose==1.3.7
+p4python==2016.2.1498648
+py==1.4.34
+pytest==3.1.1
+six==1.10.0
+smmap2==2.0.2
+SQLAlchemy==1.1.10

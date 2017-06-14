@@ -1,0 +1,362 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>wineventcatcher.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2015 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * WinEventCatcher.cpp --
+ *
+ * Instances of WinEventCatcher track activity on an arbitrary number of
+ * Windows Event Handles.  This provides the basis for a replacement for
+ * the Windows WaitForMultipleObjects[Ex] API call, which is limited to
+ * dealing with only 64 Event Handles.  That's not sufficient for Blast on
+ * an RDSH machine where we'd like to be able to manage hundreds of
+ * sessions and therefore need to be able to wait on hundreds of worker
+ * process event handles.
+ */
+
+#include &lt;vm_assert.h&gt;
+
+#include "WinEventCatcher.h"
+
+
+/*
+ * The C callback trampoline function targeted by RegisterWaitForSingleObject
+ * is passed only a single 'context' argument but in order to do its job it
+ * must be able to obtain a reference to a WinEventCatcher instance and the
+ * value of an individual event handle, so we pack those items into an
+ * instance of this WECCallbackContext structure and specify a pointer to
+ * that structure as the trampoline's 'context' argument'
+ */
+
+struct WECCallbackContext {
+   WinEventCatcher *ccInstancePtr;
+   HANDLE ccHandle;
+};
+
+/*
+ * In addition to the per-event-handle information required by the callback
+ * trampoline, we also need to store a cancellation handle for each event
+ * handle.  Both of these things are packed into a WECHandleInfo structure,
+ * which is stored in a map keyed by the associated event handle.
+ */
+
+struct WECHandleInfo {
+   HANDLE hiCancelHandle;
+   WECCallbackContext hiCtx;
+};
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinEventCatcher constructor.  Requires a logger and a 'notify' event
+ * handle that will be signalled whenever one of the handles being watched
+ * by this instance is signalled.  The 'notify' listener can discover which
+ * of the watched handles has fired by repeatedly calling GetNextEvent().
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WinEventCatcher::WinEventCatcher(log4cxx::LoggerPtr log,    // IN
+                                 HANDLE notify)             // IN
+   :  mLog(log),
+      mNotify(notify),
+      mQueue(),
+      mQueueLock(),
+      mHandleMap(),
+      mHandleMapLock()
+<span style = "background-color:#dfd">{
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WinEventCatcher destructor.  Cancels any leftover watches, discards
+ * the corresponding handle map entries empties any previously-notified
+ * but not-yet-consumed handles.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WinEventCatcher::~WinEventCatcher()
+<span style = "background-color:#dfd">{</span>
+   /*
+    * Cancel all Handle listeners and discard their map entries, then discard
+    * any unconsumed queued events
+    */
+
+   {
+      std::map&lt;HANDLE, WECHandleInfo *&gt;::iterator iter;
+<span style = "background-color:#dfd">      AbAutoLock al(mHandleMapLock);
+      for (iter = mHandleMap.begin(); iter != mHandleMap.end(); ++iter) {</span>
+<span style = "background-color:#fdd">         HANDLE handle = static_cast&lt;HANDLE&gt; (iter-&gt;first);
+         WECHandleInfo *hip = static_cast&lt;WECHandleInfo *&gt; (iter-&gt;second);
+         VERIFY(hip != NULL);</span>
+         HANDLE cancelHandle = hip-&gt;hiCancelHandle;
+<span style = "background-color:#fdd">         CancelCatcher(handle, cancelHandle);</span>
+
+         /*
+          * Regardless of whether the cancel succeeded or not, go ahead and
+          * discard this mapping -- there's nothing else useful we can do in
+          * the failure case.
+          */
+
+<span style = "background-color:#fdd">         mHandleMap.erase(iter);
+         delete hip;</span>
+      }
+<span style = "background-color:#dfd">   }</span>
+   {
+<span style = "background-color:#dfd">      AbAutoLock al(mQueueLock);
+      while (!mQueue.empty()) {</span>
+<span style = "background-color:#fdd">         mQueue.pop();</span>
+      }
+<span style = "background-color:#dfd">   }
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CancelCatcher -- an internal helper method that cancels the wait on an
+ * individual handle.  Performing the actual cancellation is trivial but
+ * wrapping it in this function lets us avoid duplication of the log
+ * messages.
+ *
+ * Results:
+ *    TRUE if the deregistration succeeds, FALSE otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WinEventCatcher::CancelCatcher(const HANDLE handle,         // IN
+                               const HANDLE cancelHandle)   // IN
+<span style = "background-color:#dfd">{</span>
+   bool retval = false;
+
+<span style = "background-color:#dfd">   if (!UnregisterWait(cancelHandle)) {</span>
+<span style = "background-color:#fdd">      DWORD errcode = GetLastError();
+      if (ERROR_IO_PENDING == errcode) {</span>
+         // unregister succeeded -- this is informational, not a real error
+         retval = true;
+         LOG_INFO(mLog,
+                "Callback in progress on unregistering wait for handle %"
+                              FMTHNDL " with cancel handle %" FMTHNDL,
+                handle,
+<span style = "background-color:#fdd">                cancelHandle);
+      } else {</span>
+         LOG_ERROR(mLog,
+                "Failed to unregister wait for handle %" FMTHNDL
+                              " with cancel handle %" FMTHNDL ", error:0x%08lx",
+                handle,
+                cancelHandle,
+<span style = "background-color:#fdd">                errcode);</span>
+      }
+<span style = "background-color:#fdd">   } else {</span>
+      retval = true;
+      LOG_TRACE(mLog,
+                "Unregistered wait for handle %" FMTHNDL
+                                 " with cancel handle %" FMTHNDL,
+                handle,
+<span style = "background-color:#fdd">                cancelHandle);</span>
+   }
+<span style = "background-color:#dfd">   return retval;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * OnEventCallback -- the instance-level callback for an event on a
+ * watched handle.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WinEventCatcher::OnEventCallback(HANDLE handle)    // IN
+<span style = "background-color:#dfd">{</span>
+   {
+<span style = "background-color:#dfd">      AbAutoLock al(mQueueLock);
+      mQueue.push(handle);
+   }
+   SetEvent(mNotify);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CallbackTrampoline -- a static callback function that forwards a
+ * signalled handle to the OnEventCallback method in the appropriate
+ * WinEventCatcher instance.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static VOID CALLBACK
+CallbackTrampoline(PVOID context,         // IN
+                   BOOLEAN timerFired)    // IN
+<span style = "background-color:#dfd">{</span>
+   WECCallbackContext *ccp = (WECCallbackContext *) context;
+<span style = "background-color:#dfd">   VERIFY(NULL != ccp);
+   WinEventCatcher *wec = ccp-&gt;ccInstancePtr;
+   VERIFY(NULL != wec);
+   wec-&gt;OnEventCallback(ccp-&gt;ccHandle);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AddHandle -- accepts an event handle that is to be watched
+ *
+ * Results:
+ *    TRUE if the handle is successfully placed on watch or is already
+ *    being watched, otherwise FALSE.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WinEventCatcher::AddHandle(HANDLE handle)    // IN: a HANDLE to listen on
+<span style = "background-color:#dfd">{
+   bool retval = false;</span>
+   std::map&lt;HANDLE, WECHandleInfo *&gt;::iterator iter;
+   do {  // do..while(0) lets us 'break' to skip to the end of this block
+<span style = "background-color:#dfd">      AbAutoLock al(mHandleMapLock);
+      iter = mHandleMap.find(handle);
+      if (iter != mHandleMap.end()) {</span>
+         // We are already listening on this HANDLE
+<span style = "background-color:#fdd">         retval = true;</span>
+         LOG_WARN(mLog,
+                  "Already registered wait for handle %" FMTHNDL,
+<span style = "background-color:#fdd">                  handle);
+         break;</span>
+      }
+
+<span style = "background-color:#dfd">      WECHandleInfo *hip = new WECHandleInfo;
+      VERIFY(hip != NULL);
+      hip-&gt;hiCtx.ccInstancePtr = this;
+      hip-&gt;hiCtx.ccHandle = handle;</span>
+      if (!RegisterWaitForSingleObject(&amp;hip-&gt;hiCancelHandle,
+                                      handle,
+                                      CallbackTrampoline,
+                                      &amp;hip-&gt;hiCtx,
+                                      INFINITE,
+<span style = "background-color:#dfd">                                      WT_EXECUTEONLYONCE)) {</span>
+         LOG_ERROR(mLog,
+                   "Failed to register wait for handle %" FMTHNDL
+                                 ", error:0x%08lx",
+                   handle,
+<span style = "background-color:#fdd">                   GetLastError());
+         delete hip;
+         break;</span>
+      }
+
+      /*
+       * Remember this handle's info (its registration cancellation cookie
+       * and callback context) in our internal map
+       */
+
+      std::pair&lt;HANDLE, WECHandleInfo *&gt; handleMapInfo =
+                        std::pair&lt;HANDLE, WECHandleInfo *&gt;(handle, hip);
+<span style = "background-color:#dfd">      mHandleMap.insert(handleMapInfo);
+      retval = true;</span>
+      LOG_TRACE(mLog,
+                "Registered wait for handle %" FMTHNDL
+                                 " with cancel handle %" FMTHNDL,
+                handle,
+<span style = "background-color:#dfd">                hip-&gt;hiCancelHandle);
+   } while (0);</span>
+
+<span style = "background-color:#dfd">   return retval;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * RemoveHandle -- stops watching a handle that was previously placed on
+ * watch by a call to AddHandle.
+ *
+ * Results:
+ *    TRUE if the watch on the given handle is successfully cancelled,
+ *    otherwise FALSE.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WinEventCatcher::RemoveHandle(HANDLE handle) // IN: a HANDLE being listened on
+<span style = "background-color:#dfd">{
+   bool retval = false;</span>
+   {
+      std::map&lt;HANDLE, WECHandleInfo *&gt;::iterator iter;
+<span style = "background-color:#dfd">      AbAutoLock al(mHandleMapLock);
+      iter = mHandleMap.find(handle);
+      if (iter != mHandleMap.end()) {
+         HANDLE handle = static_cast&lt;HANDLE&gt; (iter-&gt;first);
+         WECHandleInfo *hip = static_cast&lt;WECHandleInfo *&gt; (iter-&gt;second);
+         VERIFY(hip != NULL);</span>
+         HANDLE cancelHandle = hip-&gt;hiCancelHandle;
+<span style = "background-color:#dfd">         retval = CancelCatcher(handle, cancelHandle);</span>
+
+         /*
+          * Regardless of whether the cancel succeeded or not, go ahead and
+          * discard this mapping -- there's nothing else useful we can do in
+          * the failure case.
+          */
+
+<span style = "background-color:#dfd">         mHandleMap.erase(iter);
+         delete hip;</span>
+      }
+<span style = "background-color:#dfd">   }
+   return retval;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * GetNextEvent -- tells the caller the value of a handle that was
+ * signalled at some time in the past.  Handles are reported in the
+ * order that they were signalled.
+ *
+ * Results:
+ *    The oldest unconsumed handle, or INVALID_HANDLE_VALUE if all
+ *    previously-signalled handles have been consumed.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+HANDLE
+WinEventCatcher::GetNextEvent()
+<span style = "background-color:#dfd">{
+   HANDLE retval = INVALID_HANDLE_VALUE;</span>
+
+   {
+<span style = "background-color:#dfd">      AbAutoLock al(mQueueLock);
+      if (!mQueue.empty()) {
+         retval = mQueue.front();
+         mQueue.pop();</span>
+      }
+<span style = "background-color:#dfd">   }</span>
+
+<span style = "background-color:#dfd">   return retval;
+}</span></pre>
+	</body>
+</html>

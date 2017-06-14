@@ -1,0 +1,1803 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>workersessionmgr.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * WorkerSessionMgr.cpp --
+ *
+ *   Implementation of WorkerSessionMgr class that creates and monitors the
+ *   AppBlast worker process and session(s).
+ */
+
+#include &lt;string&gt;
+
+#include &lt;aclapi.h&gt;
+#include &lt;windows.h&gt;
+#include &lt;Wtsapi32.h&gt;
+#include &lt;process.h&gt;
+
+// appblastlibs
+#include "vm_basic_types.h"
+
+// appblast/pipelib
+#include "PipeCommon.h"
+#include "PipeDefs.h"
+
+// appblast/common
+#include "appBlastUtil.h"
+#include "IWebSocket.h"
+#include "WinVersion.h"
+
+// appblast/service
+#include "CreateProcessWithToken.h"
+#include "MainAppService.h"
+#include "WinService.h"
+#include "WinEventCatcher.h"
+#include "WorkerProcess.h"
+#include "WorkerSessionMgr.h"
+
+// suppress C++ template expansion spam (for std::string) in logs from this file
+#undef __LOG4CXX_FUNC__
+#define __LOG4CXX_FUNC__ __FUNCTION__
+
+enum {
+   // Maximum wait for WTS_SESSION_LOGOFF to post.
+   LOG_OFF_TIMEOUT_MS = (15 * 1000)
+};
+
+/* The singleton instance. */
+WorkerSessionMgr *WorkerSessionMgr::sInstance = NULL;
+
+<span style = "background-color:#dfd">const std::string LOG_NAME = "WorkerSessionMgr";</span>
+
+#define DEFINE_LOGGER log4cxx::LoggerPtr LOG = log4cxx::Logger::getLogger(LOG_NAME)
+
+template &lt;typename T&gt;
+std::string ToString(T value)
+<span style = "background-color:#dfd">{
+   std::ostringstream os;
+   os &lt;&lt; value;
+   return os.str();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::WorkerSessionMgr --
+ *
+ *    Private constructor.  Caller should use the singleton interface to get
+ *    an instance.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WorkerSessionMgr::WorkerSessionMgr()
+   : mMonitorThread(NULL),
+     mEndMonitorEvent(NULL),
+     mLogOffEvent(NULL),
+     mStartWorkerEvent(NULL),
+     mConsoleStateChangedCxn(),
+     mNotifyFailure(NULL),
+     mLog(log4cxx::Logger::getLogger(LOG_NAME)),
+     mPipeRead(NULL),
+     mPipeSA(NULL),
+     mPipeServerBlastSToWave(NULL),
+     mPendingSessionsLock(),
+     mWorkerProcessWTSSessionId(-1)
+<span style = "background-color:#dfd">{</span>
+   bool securePipes = true;
+<span style = "background-color:#dfd">   bool enableBlastToWavePipe = false;</span>
+#ifdef DEVELOPER_FRIENDLY
+   /* Dev builds can make the pipes available to anyone */
+   MainAppService::Get()-&gt;GetConfig()-&gt;GetBool(CONFIG_SECURE_PIPES, securePipes);
+#endif
+   MainAppService::Get()-&gt;GetConfig()-&gt;GetBool(CONFIG_ENABLE_BLAST_TO_WAVE_PIPE,
+<span style = "background-color:#dfd">                                               enableBlastToWavePipe);</span>
+   if (securePipes) {
+      /* A locked-down SECURITY_ATTRIBUTES for LocalSystem access only */
+<span style = "background-color:#dfd">      mPipeSA = pipelib::PipeSecurityAttr::CreateLocalSystemInstance(GENERIC_ALL);</span>
+   }
+   // we check these for validity in Start()
+<span style = "background-color:#dfd">   mPipeRead = new pipelib::PipeServer(WORKER_TO_SERVICE_PIPE_NAME, this, mPipeSA);</span>
+
+   /*
+    * Blast2Wave pipe currently is turned on when opt/obj build is
+    * used by default. On release/beta build, users can turn it on by setting
+    * registry key. We append a session ID behind to create a session specific
+    * pipe name. This way, in RDSH, wave could talk to blast in windows
+    * session with a specific named pipe
+    */
+<span style = "background-color:#dfd">   if (enableBlastToWavePipe) {</span>
+      mPipeServerBlastSToWave =
+         new pipelib::PipeServer(BLASTS_TO_WAVE_PIPE_NAME,
+                                 this,
+<span style = "background-color:#fdd">                                 NULL);</span>
+   }
+
+<span style = "background-color:#dfd">   mPendingSessions.clear();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::~WorkerSessionMgr --
+ *
+ *    Destructor.  Cleanup is done in Shutdown().
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WorkerSessionMgr::~WorkerSessionMgr()
+<span style = "background-color:#fdd">{
+   delete mPipeRead;
+   mPipeRead = NULL;</span>
+
+<span style = "background-color:#fdd">   delete mPipeServerBlastSToWave;
+   mPipeServerBlastSToWave = NULL;</span>
+
+<span style = "background-color:#fdd">   delete mPipeSA;
+   mPipeSA = NULL;</span>
+
+<span style = "background-color:#fdd">   mConsoleStateChangedCxn.disconnect();
+}</span>
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::Create --
+ *
+ *      Create an instance of the WorkerSession manager.
+ *
+ * Results:
+ *      IWorkerSessionMgr instance.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+IWorkerSessionMgr*
+WorkerSessionMgr::Create()
+{
+   if (!sInstance) {
+      sInstance = new WorkerSessionMgr();
+   }
+
+   return sInstance;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * IWorkerSessionMgr::GetInstance --
+ *
+ *    This method creates the singleton instance if it is not created yet.
+ *    First time call to this function should happen in app initialization,
+ *    since it is not thread safe.
+ *
+ * Results:
+ *    The singleton instance.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+IWorkerSessionMgr *
+IWorkerSessionMgr::GetInstance()
+<span style = "background-color:#dfd">{
+   return WorkerSessionMgr::Create();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::Start --
+ *
+ *    Starts a separate thread.  The thread will locate the console session and
+ *    start a worker process in that session.  It monitors the worker process
+ *    handle, and will recreate worker process in a new console session when
+ *    the existing one is killed and old console is cleaned up during logoff.
+ *    Caller can optionally pass in a failure notification call back in case
+ *    the thread fails to create new worker process inside the thread loop.
+ *
+ * Results:
+ *    true - if the thread started successfully.
+ *    false - if the thread failed to start.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::Start(FailureCallback notifyFailure) // IN/OPT
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();</span>
+
+   /*
+    * First, wait for Terminal Services to start up, or the WTS* family of
+    * functions may return RPC_E_INVALID_BINDING.
+    */
+<span style = "background-color:#fdd">   HANDLE tsReadyEvent = OpenEvent(SYNCHRONIZE, FALSE, L"Global\\TermSrvReadyEvent");
+   if (!tsReadyEvent) {</span>
+      LOG_ERROR(mLog, "Open tsReadyEvent failed, error:0x%08lx (%I64d ms).",
+<span style = "background-color:#fdd">                GetLastError(), AbUtil::GetClock64() - startTime);
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   if (WaitForSingleObject(tsReadyEvent, INFINITE) != WAIT_OBJECT_0) {</span>
+      LOG_ERROR(mLog, "Waiting for tsReadyEvent failed, error:0x%08lx "
+                "(%I64d ms).", GetLastError(),
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      CloseHandle(tsReadyEvent);
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   CloseHandle(tsReadyEvent);</span>
+
+<span style = "background-color:#fdd">   mNotifyFailure = notifyFailure;</span>
+
+<span style = "background-color:#fdd">   ASSERT(mPipeRead);
+   if (!mPipeRead-&gt;Start()) { // message pipe</span>
+      LOG_ERROR(mLog, "Could not start worker-to-service pipe! (%I64d ms).",
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   if (mPipeServerBlastSToWave) {
+      if (!mPipeServerBlastSToWave-&gt;Start(true)) { // binary pipe</span>
+         LOG_ERROR(mLog, "Could not start blasts-to-wave pipe! (%I64d ms).",
+<span style = "background-color:#fdd">                   AbUtil::GetClock64() - startTime);
+         return false;</span>
+      }
+<span style = "background-color:#fdd">      LOG_INFO(mLog, "Blast service pipe server to WAVE started");</span>
+   }
+
+   /*
+    * This shutdown event is used to tell worker process manager thread
+    * to shut down from the service context.
+    * This event used to be manual-reset, but is now auto-reset.
+    */
+<span style = "background-color:#fdd">   mEndMonitorEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+   if (!mEndMonitorEvent) {</span>
+      LOG_ERROR(mLog, "Failed to create event, error:0x%08lx (%I64d ms).",
+<span style = "background-color:#fdd">                GetLastError(), AbUtil::GetClock64() - startTime);
+      ASSERT(0);</span>
+      return false;
+   }
+
+   // Windows adaptation of svcConsoleStateChanged(CS_LOGGED_OFF) event
+<span style = "background-color:#fdd">   mLogOffEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+   if (!mLogOffEvent) {</span>
+      LOG_ERROR(mLog, "Failed to create event, error:0x%08lx (%I64d ms).",
+<span style = "background-color:#fdd">                GetLastError(), AbUtil::GetClock64() - startTime);
+      ASSERT(0);</span>
+      return false;
+   }
+
+<span style = "background-color:#fdd">   mStartWorkerEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+   if (!mStartWorkerEvent) {</span>
+      LOG_ERROR(mLog, "Failed to create event, error:0x%08lx (%I64d ms).",
+<span style = "background-color:#fdd">                GetLastError(), AbUtil::GetClock64() - startTime);
+      ASSERT(0);</span>
+      return false;
+   }
+
+   // Not to be confused with the one formerly in MainAppService.cpp.
+   mConsoleStateChangedCxn = WinService::GetInstance()-&gt;svcConsoleStateChanged.connect(
+<span style = "background-color:#fdd">      sigc::mem_fun(this, &amp;WorkerSessionMgr::OnConsoleStateChanged));</span>
+
+   LOG_DEBUG(mLog, "WorkerSessionMgr started successfully (%I64d ms).",
+<span style = "background-color:#fdd">             AbUtil::GetClock64() - startTime);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::Shutdown --
+ *
+ *    Shutdown the thread that monitors and creates worker process.  When it
+ *    returns, resources are cleaned up.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WorkerSessionMgr::Shutdown()
+<span style = "background-color:#fdd">{
+   if (mEndMonitorEvent) {
+      SetEvent(mEndMonitorEvent);
+   } else {
+      LOG_ERROR(mLog, "EndMonitorEvent is unexpectedly not defined");</span>
+   }
+
+<span style = "background-color:#fdd">   if (mMonitorThread) {</span>
+      // Used to be a 2s timeout, but not enough for worker process to exit...
+<span style = "background-color:#fdd">      DWORD waitResult = WaitForSingleObject(mMonitorThread, INFINITE);
+      if (waitResult != WAIT_OBJECT_0) {</span>
+         LOG_INFO(mLog, "Failed to wait for the thread to exit, error:0x%08lx.",
+<span style = "background-color:#fdd">                  waitResult);</span>
+      }
+<span style = "background-color:#fdd">      CloseHandle(mMonitorThread);
+      mMonitorThread = NULL;</span>
+   }
+
+   /*
+    * Stop the pipe server (to receives message from worker) after all workers
+    * has died. Otherwise, workers will have issues dying as worker needs to
+    * send SESSION_DELETED message to agent (via service).
+    */
+<span style = "background-color:#fdd">   mPipeRead-&gt;Stop();</span>
+
+<span style = "background-color:#fdd">   if (mPipeServerBlastSToWave) {
+      mPipeServerBlastSToWave-&gt;Stop();</span>
+   }
+
+<span style = "background-color:#fdd">   if (mEndMonitorEvent) {
+      CloseHandle(mEndMonitorEvent);
+      mEndMonitorEvent = NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   if (mLogOffEvent) {
+      CloseHandle(mLogOffEvent);
+      mLogOffEvent = NULL;
+   } else {
+      LOG_ERROR(mLog, "LogOffEvent is unexpectedly not defined");</span>
+   }
+
+<span style = "background-color:#fdd">   if (mStartWorkerEvent) {
+      CloseHandle(mStartWorkerEvent);
+      mStartWorkerEvent = NULL;
+   } else {
+      LOG_ERROR(mLog, "StartWorkerEvent is unexpectedly not defined");</span>
+   }
+
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "WorkerSessionMgr shutdown completed.");
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::ThreadProc --
+ *
+ *    The worker process monitor thread entry.
+ *
+ * Results:
+ *    Not used.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+unsigned int
+WorkerSessionMgr::ThreadProc(void *ptr) // IN
+<span style = "background-color:#fdd">{</span>
+   WorkerSessionMgr *that = (WorkerSessionMgr *)ptr;
+   return that-&gt;CreateWorkerAndMonitor();
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::RecordWorkerProcess --
+ *
+ *    Creates an instance of class WorkerProcess for the given process handle,
+ *    and records into the maps.
+ *
+ * Results:
+ *    true if succeeds, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::RecordWorkerProcess(DWORD wtsSessionId,           // IN
+                                      HANDLE workerProcessHandle,   // IN
+                                      const std::wstring &amp;pipeName) // IN
+<span style = "background-color:#dfd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+   boost::shared_ptr&lt;WorkerProcess&gt; workerProcessSharedPtr =
+<span style = "background-color:#dfd">      GetWorkerProcess(wtsSessionId);
+   if (workerProcessSharedPtr) {</span>
+      // Not supposed to enter here, so logs an error here.
+<span style = "background-color:#dfd">      LOG_ERROR(mLog, "The worker process already exists unexpectedly.");
+      return false;</span>
+   }
+
+   // Creates WorkerProcess instance specific for the Worker process
+   WorkerProcess *pWorkerProcess =
+<span style = "background-color:#dfd">      new WorkerProcess(wtsSessionId, workerProcessHandle, pipeName);
+   if (!pWorkerProcess) {</span>
+      LOG_ERROR(mLog, "Could not allocate memory for WorkerProcess "
+<span style = "background-color:#fdd">                "instance with WTSSessionId:%lu.", wtsSessionId);
+      return false;</span>
+   }
+<span style = "background-color:#dfd">   workerProcessSharedPtr.reset(pWorkerProcess);
+   mWorkerProcessMap[ToString(wtsSessionId)] = workerProcessSharedPtr;
+   mWorkerIds.insert(wtsSessionId);</span>
+
+<span style = "background-color:#dfd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::CreateWorkerAndMonitor --
+ *
+ *    The worker process monitor thread entry at instance level.  It runs in a
+ *    loop, monitors the worker process handle and locates a new console
+ *    session during boot or during logoff.
+ *
+ * Results:
+ *    Not used.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DWORD
+WorkerSessionMgr::CreateWorkerAndMonitor(void)
+<span style = "background-color:#fdd">{</span>
+   HANDLE workerProcess = NULL;
+<span style = "background-color:#fdd">   bool failureExit = true;
+   bool isEndMonitorEvent = false;
+   bool createNewWorkerProc = true;
+   DWORD exitCode = 0;
+   std::string uuid;</span>
+   DWORD wtsSessionId = INVALID_TS_SESSION_ID;
+   bool useIPv6 = false;
+
+   int startPort;
+   int numPorts;
+<span style = "background-color:#fdd">   MainAppService::Get()-&gt;GetUDPPortInfo(startPort, numPorts);</span>
+
+<span style = "background-color:#fdd">   HANDLE deadWorkerEvent = CreateEvent(NULL, FALSE, FALSE, NULL);</span>
+   WinEventCatcher deadWorkerCatcher
+<span style = "background-color:#fdd">                              = WinEventCatcher(mLog, deadWorkerEvent);</span>
+   /*
+    * In the loop that forms the body of this thread's activity we need to
+    * wait on three event handles: mEndMonitorEvent tells us to shut down;
+    * mStartWorkerEvent tells us that we might need to start some new
+    * workers; and deadWorkerEvent tells us that some workers have died.
+    */
+<span style = "background-color:#fdd">   HANDLE events[] = { mEndMonitorEvent,
+                       mStartWorkerEvent,
+                       deadWorkerEvent };</span>
+   static const int numEvents = sizeof events / sizeof events[0];
+
+   while (TRUE) {
+      bool bSessionListIsEmpty = true;
+
+      {
+<span style = "background-color:#fdd">         AbAutoLock al(mPendingSessionsLock);
+         bSessionListIsEmpty = mPendingSessions.empty();
+      }</span>
+
+      if (!isEndMonitorEvent &amp;&amp;
+<span style = "background-color:#fdd">          (createNewWorkerProc || !bSessionListIsEmpty)) {
+         LOG_INFO(mLog, "Creating worker process...");</span>
+
+<span style = "background-color:#fdd">         uuid = AbUtil::CreateGuidString();
+         createNewWorkerProc = false;</span>
+         {
+<span style = "background-color:#fdd">            AbAutoLock al(mPendingSessionsLock);
+            if (mPendingSessions.empty()) {
+               continue;</span>
+            }
+<span style = "background-color:#fdd">            PendingSession pending = mPendingSessions.front();</span>
+            wtsSessionId = pending.wtsSessionId;
+<span style = "background-color:#fdd">            useIPv6 = pending.useIPv6;
+            mPendingSessions.pop_front();
+         }</span>
+
+<span style = "background-color:#fdd">         if (wtsSessionId == INVALID_TS_SESSION_ID) {</span>
+            LOG_ERROR(mLog, "Invalid WTSSessionID:%lu. Skip creating "
+<span style = "background-color:#fdd">                      "worker process.", wtsSessionId);
+            break;</span>
+         }
+         LOG_INFO(mLog, "Creating worker process for WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                  wtsSessionId);</span>
+
+         /*
+          * Tell each worker to listen on any available port, using
+          * the loopback IP.
+          */
+<span style = "background-color:#fdd">         const std::wstring ip4 = L"127.0.0.1";
+         const std::wstring ip6 = L"::1";</span>
+         const int port = 0;
+
+         WCHAR mod0Path[MAX_PATH];
+         DWORD ret = GetModuleFileNameW(GetModuleHandle(0), mod0Path,
+<span style = "background-color:#fdd">                                        ARRAYSIZE(mod0Path));
+         if (ret == 0) {</span>
+            LOG_ERROR(mLog, "Unable to get module filename, error:0x%08lx. "
+                      "Skip creating worker process for WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                      GetLastError(), wtsSessionId);
+            ASSERT(0);</span>
+            break;
+         }
+
+         /*
+          * Since VMBlastW is not loaded by the current process,
+          * GetModuleHandle does not seem to be able to find it. So do some
+          * manipulation of the names below to replace VMBlastS with VMBlastW.
+          * Probably need to find a nicer way eventually to handle this.
+          */
+<span style = "background-color:#fdd">         std::wstring exePathAndName(mod0Path);
+         std::wstring serviceName(L"VMBlastS");
+         std::wstring workerName(L"VMBlastW");
+         size_t serviceNamePos = exePathAndName.find(serviceName.c_str());</span>
+         exePathAndName.replace(serviceNamePos, serviceName.size(),
+<span style = "background-color:#fdd">                                workerName.c_str());</span>
+
+<span style = "background-color:#fdd">         std::wostringstream cmdLine;
+         std::wstring wuuid = AbUtil::CharToWide(uuid);
+         bool udpConfigEnabled = MainAppService::Get()-&gt;IsUdpConfigEnabled();</span>
+
+         cmdLine
+            &lt;&lt; L"\"" &lt;&lt; exePathAndName.c_str()
+            &lt;&lt; L"\" -uuid " &lt;&lt; wuuid
+            &lt;&lt; L" -ip " &lt;&lt; (useIPv6 ? ip6 : ip4)
+            &lt;&lt; L" -loopbackport " &lt;&lt; port
+            &lt;&lt; L" -clientportstart " &lt;&lt; startPort
+            &lt;&lt; L" -numports " &lt;&lt; numPorts
+            &lt;&lt; L" -nossl -nofwopenport"
+<span style = "background-color:#fdd">            &lt;&lt; (udpConfigEnabled ? L" -udpenabled" : L"");</span>
+
+         workerProcess = CreateProcessInInteractiveSession(exePathAndName.c_str(),
+                                                           cmdLine.str().c_str(),
+<span style = "background-color:#fdd">                                                           wtsSessionId);</span>
+
+<span style = "background-color:#fdd">         if (!workerProcess) {</span>
+            LOG_ERROR(mLog, "Failed to start worker process into user/console "
+<span style = "background-color:#fdd">                      "session, WTSSessionID:%lu.", wtsSessionId);
+            break;</span>
+         } else {
+            {
+               LOG_INFO(mLog, "A new worker process (h=%" FMTHNDL ") was "
+                              "created in the user/console WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                        workerProcess, wtsSessionId);
+               std::wostringstream clientPipeName;
+               clientPipeName &lt;&lt; SERVICE_TO_WORKER_PIPE_NAME &lt;&lt; L"-" &lt;&lt; wuuid;</span>
+               if (!RecordWorkerProcess(wtsSessionId, workerProcess,
+<span style = "background-color:#fdd">                                        clientPipeName.str())) {</span>
+                  LOG_ERROR(mLog, "Failed to record worker process for WTSSessionID:"
+<span style = "background-color:#fdd">                            "%lu.", wtsSessionId);
+                  ASSERT(false);</span>
+               }
+<span style = "background-color:#fdd">            }</span>
+
+            // Arrange to be informed when this workerProcess dies
+<span style = "background-color:#fdd">            deadWorkerCatcher.AddHandle(workerProcess);</span>
+         }
+
+         // We might have more sessions queued in which to start worker processes
+<span style = "background-color:#fdd">         continue;</span>
+
+      } // creating worker process
+
+      int numWorkers = mWorkerIds.size();
+<span style = "background-color:#fdd">      if (isEndMonitorEvent &amp;&amp; (numWorkers == 0)) {
+         LOG_INFO(mLog, "Shutdown requested, no workers. Exiting loop.");
+         failureExit = false;</span>
+         break;
+      }
+
+      /*
+       * Startup activities are now complete, so now we wait until one of
+       * the stop-all, want-worker or dead-worker events fires to indicate
+       * the need for further action.
+       */
+
+      DWORD waitResult = WaitForMultipleObjectsEx(numEvents, events,
+<span style = "background-color:#fdd">                                                  FALSE, INFINITE, TRUE);</span>
+      if ((waitResult &gt;= WAIT_OBJECT_0)
+<span style = "background-color:#fdd">             &amp;&amp; (waitResult &lt; (WAIT_OBJECT_0 + numEvents))) {</span>
+
+<span style = "background-color:#fdd">         HANDLE thisEvent = events[waitResult - WAIT_OBJECT_0];</span>
+
+<span style = "background-color:#fdd">         if (thisEvent == deadWorkerEvent) {</span>
+            // Drain all dead-worker handles
+            while ((workerProcess = deadWorkerCatcher.GetNextEvent())
+<span style = "background-color:#fdd">                                       != INVALID_HANDLE_VALUE) {</span>
+               LOG_INFO(mLog,
+                        "Worker Process handle:%" FMTHNDL " event detected",
+<span style = "background-color:#fdd">                        workerProcess);</span>
+
+<span style = "background-color:#fdd">               deadWorkerCatcher.RemoveHandle(workerProcess);</span>
+
+               // Determine which wtsSessionId this handle was for
+<span style = "background-color:#fdd">               wtsSessionId = GetWTSSessionId(workerProcess);</span>
+
+<span style = "background-color:#fdd">               BOOL success = GetExitCodeProcess(workerProcess, &amp;exitCode);
+               if (success == 0) {</span>
+                  LOG_WARN(mLog, "GetExitCodeProcess failed for WTSSessionID:"
+                           "%lu worker process, error:0x%08lx.",
+<span style = "background-color:#fdd">                           wtsSessionId, GetLastError());</span>
+               }
+               LOG_INFO(mLog, "Worker process %" FMTHNDL " in WTSSessionID:%lu "
+                        "exited, exitcode:0x%08lx.",
+<span style = "background-color:#fdd">                        workerProcess, wtsSessionId, exitCode);</span>
+
+<span style = "background-color:#fdd">               std::string vauth = GetPrimaryVAuth(wtsSessionId);
+               if (!vauth.empty()) {</span>
+                  LOG_WARN(mLog, "vAuth for worker in WTSSessionID:%lu is %s, "
+                           "Purging session", wtsSessionId,
+<span style = "background-color:#fdd">                           Log_Token(vauth).c_str());
+                  PurgeSession(vauth, false);</span>
+
+<span style = "background-color:#fdd">                  if (exitCode != 0x40010004) {</span>
+                     /*
+                      * Send the session delete message to view agent so that
+                      * it will lock the console.
+                      */
+                     VDPConnectionResult reason = VDPCONNECT_FAILURE;
+                     LOG_WARN(mLog, "Worker exited, disconnect WTSSessionID:"
+                              "%lu, vAuth:%s, reason:%d.",
+<span style = "background-color:#fdd">                              wtsSessionId, Log_Token(vauth).c_str(), reason);
+                     SendSessionDeleteMessageToViewAgent(vauth, reason);
+                  } else {</span>
+                     LOG_WARN(mLog, "Worker is killed by the system, "
+                              "WTSSessionID:%lu, vAuth:%s.",
+<span style = "background-color:#fdd">                              wtsSessionId, Log_Token(vauth).c_str());</span>
+                  }
+<span style = "background-color:#fdd">               } else {</span>
+                  /*
+                   * This is the expected situation as prior to exiting, the
+                   * worker will notify agent of session delete (via service).
+                   * Before forwarding this message to agent, service will
+                   * perform cleanup.
+                   * Do nothing and just noted this fact.
+                   */
+                  LOG_DEBUG(mLog, "vAuth for worker in WTSSessionID:%lu is "
+                            "empty. Skipping Cleanup maps. Skipping sending "
+<span style = "background-color:#fdd">                            "delete message to agent", wtsSessionId);</span>
+               }
+
+<span style = "background-color:#fdd">               CloseHandle(workerProcess);</span>
+               workerProcess = INVALID_HANDLE_VALUE;
+
+               {
+<span style = "background-color:#fdd">                  boost::recursive_mutex::scoped_lock guard(mLock);
+                  mWorkerIds.erase(wtsSessionId);
+                  mWorkerProcessMap.erase(ToString(wtsSessionId));</span>
+                  // TODO: Purge related shadow sessions if needed.
+<span style = "background-color:#fdd">               }
+            }
+         } else if (thisEvent == mEndMonitorEvent) {
+            LOG_INFO(mLog, "Received EndMonitorEvent. Will exit.");</span>
+            /*
+             * Service is shutting down. Send the stop event to all worker processes
+             * and then return to the loop to wait for it to die. The birds' eye
+             * view is as follows:
+             * - Worker starts, and listens for 'stop' on its read pipe.
+             * - Service gets a stop signal, and relays it to worker via pipe.
+             * - Service then waits for a clean (or otherwise) exit of the worker
+             *   process, then terminates.
+             * This allows us to make sure the worker process goes down smoothly.
+             * If it doesn't, its failure is reflected in the service's refusal
+             * to stop.
+             */
+            std::set&lt;DWORD&gt;::const_iterator it;
+<span style = "background-color:#fdd">            for (it = mWorkerIds.begin(); it != mWorkerIds.end(); ++it) {
+               std::string resp;</span>
+               LOG_INFO(mLog, "Sending stop message for WTSSessionID:"
+<span style = "background-color:#fdd">                        "%lu.", *it);</span>
+               if (!SendMessageToWorker(PIPE_MSG_STOP, *it, false, resp) ||
+<span style = "background-color:#fdd">                   resp != PIPE_REPLY_OK) {</span>
+                  LOG_ERROR(mLog, "Failed to send stop to worker, response:%s.",
+<span style = "background-color:#fdd">                            resp.c_str());</span>
+               }
+<span style = "background-color:#fdd">            }</span>
+
+<span style = "background-color:#fdd">            isEndMonitorEvent = true;
+            createNewWorkerProc = false;
+         } else if (thisEvent == mStartWorkerEvent) {
+            LOG_DEBUG(mLog, "Received StartWorkerEvent. Will create new worker.");
+            createNewWorkerProc = true;</span>
+         }
+      } else {
+         LOG_ERROR(mLog,
+                   "Wait on events returned unexpected result, handle:%" FMTHNDL
+                           " error:0x%08lx.",
+                   waitResult,
+<span style = "background-color:#fdd">                   GetLastError());
+         ASSERT(0);</span>
+         break;
+      }
+<span style = "background-color:#fdd">   }</span>
+
+   LOG_INFO(mLog, "Exiting worker process manager loop (failure exit: %s)",
+<span style = "background-color:#fdd">            failureExit ? "true" : "false");
+   if (failureExit &amp;&amp; mNotifyFailure) {
+      LOG_INFO(mLog, "Triggering end notification on failure.");
+      (*mNotifyFailure)(exitCode);</span>
+   }
+
+<span style = "background-color:#fdd">   CloseHandle(deadWorkerEvent);</span>
+
+<span style = "background-color:#fdd">   return failureExit ? 1 : 0;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::CreateProcessInInteractiveSession --
+ *
+ *    Run an EXE as system using the token in the session specified.
+ *
+ * Results:
+ *    On failure, it returns NULL
+ *    On success, it returns the handle of the created process.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+HANDLE
+WorkerSessionMgr::CreateProcessInInteractiveSession(LPCWSTR appName,   // IN
+                                                    LPCWSTR cmdLine,   // IN
+                                                    DWORD wtsSessionId)// IN
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();</span>
+   HANDLE workerProcHandle = NULL;
+<span style = "background-color:#fdd">   HANDLE token = NULL;
+   HANDLE newToken = NULL;</span>
+   STARTUPINFOW si = {0};
+<span style = "background-color:#fdd">   PROCESS_INFORMATION pi = {0};</span>
+
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "Console WTSSessionID:%lu.", wtsSessionId);
+   mWorkerProcessWTSSessionId = wtsSessionId;</span>
+
+<span style = "background-color:#fdd">   if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &amp;token)) {</span>
+      if (DuplicateTokenEx(token, TOKEN_ASSIGN_PRIMARY | TOKEN_ALL_ACCESS,
+                           NULL, SecurityIdentification, TokenPrimary,
+<span style = "background-color:#fdd">                           &amp;newToken)) {</span>
+         if (!SetTokenInformation(newToken, TokenSessionId,
+                                  (LPVOID)&amp;wtsSessionId,
+<span style = "background-color:#fdd">                                  sizeof(wtsSessionId))) {</span>
+            LOG_ERROR(mLog, "SetTokenInformation failed, error:0x%08lx.",
+<span style = "background-color:#fdd">                      GetLastError());</span>
+         }
+
+<span style = "background-color:#fdd">         if (WinVersion::IsWin8OrAbove()) {</span>
+            /*
+             * In Win 8 MS added new restrictions and it prevents some api
+             * calls to work normally (as they worked for Win7). For example
+             * SendInput() call doesn't work anymore with some certain key
+             * combinations (like alt-tab and etc).
+             * Adding TokenUIAccess = 1 to the process token fixes the problem.
+             */
+<span style = "background-color:#fdd">            DWORD uiAccess = 1;</span>
+            if (!SetTokenInformation(newToken, TokenUIAccess, (LPVOID)&amp;uiAccess,
+<span style = "background-color:#fdd">                                     sizeof(uiAccess))) {</span>
+               LOG_ERROR(mLog, "SetTokenInformation(uiAccess) failed, "
+<span style = "background-color:#fdd">                         "error:0x%08lx.", GetLastError());</span>
+            }
+         }
+<span style = "background-color:#fdd">      } else {</span>
+         LOG_ERROR(mLog, "DuplicateTokenEx failed, error:0x%08lx.",
+<span style = "background-color:#fdd">                   GetLastError());</span>
+      }
+<span style = "background-color:#fdd">      CloseHandle(token);
+   } else {</span>
+      LOG_ERROR(mLog, "OpenProcessToken failed, error:0x%08lx.",
+<span style = "background-color:#fdd">                GetLastError());</span>
+   }
+
+<span style = "background-color:#fdd">   if (!newToken) {</span>
+      LOG_ERROR(mLog, "Unable to create token to create process for "
+                "WTSSessionID:%lu (%I64d ms).", wtsSessionId,
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      ASSERT(0);</span>
+      return NULL;
+   }
+
+   si.cb = sizeof si;
+   si.lpDesktop = L"winsta0\\Default"; // Interactive window.
+
+   if (CreateProcessWithToken(appName, cmdLine, newToken, FALSE,
+                              DETACHED_PROCESS | CREATE_SUSPENDED | HIGH_PRIORITY_CLASS,
+<span style = "background-color:#fdd">                              &amp;pi)) {</span>
+      LOG_INFO(mLog, "Create process for WTSSessionID:%lu (%ls) succeeded "
+               "(%I64d ms).", wtsSessionId, cmdLine,
+<span style = "background-color:#fdd">               AbUtil::GetClock64() - startTime);
+      workerProcHandle = pi.hProcess;
+      ResumeThread(pi.hThread);
+      CloseHandle(pi.hThread);</span>
+   } else {
+      LOG_ERROR(mLog, "Create process for WTSSessionID:%lu (%ls) failed, "
+                "error:0x%08lx (%I64d ms).", wtsSessionId, cmdLine,
+<span style = "background-color:#fdd">                GetLastError(), AbUtil::GetClock64() - startTime);
+      ASSERT(0);</span>
+   }
+<span style = "background-color:#fdd">   CloseHandle(newToken);</span>
+
+<span style = "background-color:#fdd">   return workerProcHandle;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::HandleStringMessage --
+ *
+ *    Implements pipelib HandleStringMessage.
+ *
+ * Results:
+ *    The response (PIPE_REPLY_OK or PIPE_REPLY_NOT_OK.)
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+WorkerSessionMgr::HandleStringMessage(const std::string&amp; msg) // IN
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();
+   std::string response;</span>
+
+   // Get cmd string from the message
+<span style = "background-color:#fdd">   std::string cmd;
+   std::stringstream ss(msg);
+   ss &gt;&gt; cmd;
+   const char * const cmdPrint = pipelib::GetCommandString(cmd);</span>
+
+   if (cmd == pipelib::ABIPC_SESSION_CREATE_MSG ||
+<span style = "background-color:#fdd">       cmd == pipelib::ABIPC_SESSION_DELETE_MSG) {</span>
+
+<span style = "background-color:#fdd">      std::string vAuth;
+      ss &gt;&gt; vAuth;
+      if (cmd == pipelib::ABIPC_SESSION_DELETE_MSG) {
+         std::string reason;
+         ss &gt;&gt; reason;</span>
+         LOG_DEBUG(mLog, "Received command:%s from worker for vAuth:%s, "
+                   "reason:%s.",
+<span style = "background-color:#fdd">                   cmdPrint, Log_Token(vAuth).c_str(), reason.c_str());
+         PurgeSession(vAuth, false);
+      } else {</span>
+         LOG_DEBUG(mLog, "Received command:%s from worker for vAuth:%s.",
+<span style = "background-color:#fdd">                   cmdPrint, Log_Token(vAuth).c_str());</span>
+      }
+
+<span style = "background-color:#fdd">      if (!MainAppService::Get()-&gt;SendMessageToViewAgent(msg, response)) {
+         response = PIPE_REPLY_NOT_OK;</span>
+      }
+<span style = "background-color:#fdd">   } else if (cmd == PIPE_MSG_CLIENT_CONNECTED) {
+      std::string vAuth;
+      ss &gt;&gt; vAuth;</span>
+      LOG_INFO(mLog, "Received command:%s from worker for vAuth:%s.",
+<span style = "background-color:#fdd">               cmdPrint, Log_Token(vAuth).c_str());
+      MainAppService::Get()-&gt;NotifyClientConnected(vAuth);
+      response = PIPE_REPLY_OK;
+   } else if (cmd == PIPE_MSG_CLIENT_DISCONNECTED) {
+      std::string vAuth;
+      ss &gt;&gt; vAuth;</span>
+      LOG_INFO(mLog, "Received command:%s from worker for vAuth:%s.",
+<span style = "background-color:#fdd">               cmdPrint, Log_Token(vAuth).c_str());
+      PurgeSession(vAuth, true);
+      response = PIPE_REPLY_OK;
+   } else if (cmd == PIPE_MSG_CLIENT_CLOSE_COMPLETE) {
+      std::string vAuth;
+      ss &gt;&gt; vAuth;</span>
+      LOG_INFO(mLog, "Received command:%s from worker for vAuth:%s.",
+<span style = "background-color:#fdd">               cmdPrint, Log_Token(vAuth).c_str());
+      PurgeSession(vAuth, true);</span>
+
+      boost::shared_ptr&lt;http2::IWebSocket&gt; pWebSocket =
+<span style = "background-color:#fdd">         GetPrimaryWebSocket(vAuth);
+      if (pWebSocket != NULL) {</span>
+         /*
+          * A valid websocket indicates a UDP connection, so we need
+          * to close the socket and clean up the map explicitly
+          */
+<span style = "background-color:#fdd">         ASSERT(pWebSocket-&gt;IsClientConnectedToWorker());
+         pWebSocket-&gt;Close();
+         boost::recursive_mutex::scoped_lock guard(mLock);
+         mPrimaryWebSocketMap.erase(vAuth);
+      }</span>
+
+<span style = "background-color:#fdd">      response = PIPE_REPLY_OK;
+   } else if (cmd == PIPE_MSG_CTRL_ALT_DEL) {
+      LOG_INFO(mLog, "Received command:%s from worker.", cmdPrint);
+      AbUtil::SendCtrlAltDel();
+      response = PIPE_REPLY_OK;
+   } else {</span>
+      LOG_ERROR(mLog, "Unexpected command:%s from worker, message:%s.",
+<span style = "background-color:#fdd">                cmdPrint, msg.c_str());
+      response = PIPE_REPLY_NOT_OK;</span>
+   }
+
+   LOG_INFO(mLog, "Handled command:%s from worker (%I64d ms).",
+<span style = "background-color:#fdd">            cmdPrint, AbUtil::GetClock64() - startTime);
+   return response;
+}</span>
+
+
+ /*
+  *-----------------------------------------------------------------------------
+  *
+  * WorkerSessionMgr::HandleBinaryMessage --
+  *
+  *    Implements pipelib HandleBinaryMessage.
+  *    This is the handler for binary messages from WAVE
+  *
+  * Results:
+  *    None.
+  *
+  *-----------------------------------------------------------------------------
+  */
+
+std::vector&lt;char&gt;
+WorkerSessionMgr::HandleBinaryMessage(const char *pData, // IN
+                                      unsigned int size) // IN
+<span style = "background-color:#fdd">{
+   std::vector&lt;char&gt; statusData;</span>
+
+<span style = "background-color:#fdd">   if (CollectorInstance::Get()-&gt;NotifyReporters((void *)pData, size)) {
+      if (!CollectorInstance::Get()-&gt;DrainBuffer(statusData)) {
+         LOG_WARN(mLog, "No data drained from %p ", CollectorInstance::Get());</span>
+      }
+   }
+<span style = "background-color:#fdd">   return statusData;
+}</span>
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::DumpWTSState --
+ *
+ *    Logs information about the current Terminal Server sessions on the system.
+ *    Very useful for debugging future problems involving WTS.
+ *    A static method that can be called without a WorkerProcessMgr instance.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WorkerSessionMgr::DumpWTSState()
+{
+   WTS_SESSION_INFOW *sessionInfoArray = NULL;
+   DWORD sessionCount;
+   LPWSTR retPtr = NULL;
+   DWORD retBytes = 0;
+
+   DEFINE_LOGGER;
+
+   if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1,
+                              &amp;sessionInfoArray, &amp;sessionCount)) {
+      LOG_ERROR(LOG, "WTSEnumerateSessions failed, error:0x%08lx.",
+                GetLastError());
+      return;
+   }
+
+   for (DWORD i = 0; i &lt; sessionCount; i++) {
+      WTS_SESSION_INFO *info = &amp;sessionInfoArray[i];
+      std::wstring winStationName;
+      std::wstring userName;
+
+      if (info-&gt;SessionId == 0) {
+         // Skip the service session (WTSQuerySessionInformation doesn't work)
+         continue;
+      }
+
+      // Get session name
+      if (!WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE,
+                                      info-&gt;SessionId, WTSWinStationName,
+                                      &amp;retPtr, &amp;retBytes)) {
+         LOG_ERROR(LOG, "WTSQuerySessionInformation failed, error:0x%08lx.",
+                   GetLastError());
+         continue;
+      }
+
+      winStationName = retPtr;
+      WTSFreeMemory(retPtr);
+
+      // Get user name
+      if (!WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE,
+                                      info-&gt;SessionId, WTSUserName,
+                                      &amp;retPtr, &amp;retBytes)) {
+         LOG_ERROR(LOG, "WTSQuerySessionInformation failed, error:0x%08lx.",
+                   GetLastError());
+         continue;
+      }
+
+      userName = retPtr;
+      WTSFreeMemory(retPtr);
+
+      LOG_INFO(LOG, "WTSSessionID:%lu (%s) in state %d, logged in as '%s'",
+               info-&gt;SessionId, AbUtil::WideToChar(winStationName).c_str(),
+               info-&gt;State, AbUtil::WideToChar(userName).c_str());
+   }
+
+   WTSFreeMemory(sessionInfoArray);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::OnConsoleStateChanged --
+ *
+ *    Sets mLogOffEvent when CS_LOGGED_OFF is emitted from this sigc
+ *    event. (There's no sigc::signal::wait() method, which I would like to
+ *    use instead.) Resets it when CS_LOGGED_ON arrives.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WorkerSessionMgr::OnConsoleStateChanged(ConsoleState cs,         // IN
+                                        DWORD wtsSessionId)      // IN
+<span style = "background-color:#fdd">{
+   if (cs == CS_LOGGED_OFF) {
+      LOG_INFO(mLog, "CS_LOGGED_OFF, WTSSessionID:%lu.", wtsSessionId);
+      std::set&lt;DWORD&gt;::const_iterator it = mWorkerIds.find(wtsSessionId);
+      if (it != mWorkerIds.end()) {
+         std::string resp;</span>
+         if (!SendMessageToWorker(PIPE_MSG_STOP, *it, false, resp) ||
+<span style = "background-color:#fdd">             resp != PIPE_REPLY_OK) {</span>
+            LOG_ERROR(mLog, "Failed to send stop to worker WTSSessionID:%lu, "
+<span style = "background-color:#fdd">                      "response:%s.", wtsSessionId, resp.c_str());</span>
+         }
+<span style = "background-color:#fdd">      }
+   } else if (cs == CS_LOGGED_ON) {</span>
+      LOG_INFO(mLog, "CS_LOGGED_ON not handled, WTSSessionID:%lu.",
+<span style = "background-color:#fdd">               wtsSessionId);
+   } else if (cs == CS_UNLOCKED) {
+      LOG_INFO(mLog, "CS_UNLOCKED, WTSSessionID:%lu.", wtsSessionId);
+      ResetEvent(mLogOffEvent);</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::IsWorkerAlive --
+ *
+ *    Check the SessionUuidMap map to determine if there is any entry for
+ *    the specified session id. That will indicate whether we have a worker
+ *    alive for that sessionId.
+ *
+ * Results:
+ *    true if worker is alive in that session, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::IsWorkerAlive(DWORD wtsSessionId)  // IN
+<span style = "background-color:#fdd">{</span>
+   LOG_DEBUG(mLog, "Check if worker process is alive for WTSSessionID:%lu.",
+<span style = "background-color:#fdd">             wtsSessionId);</span>
+
+<span style = "background-color:#fdd">   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess =
+<span style = "background-color:#fdd">      GetWorkerProcess(wtsSessionId);
+   if (!pWorkerProcess) {</span>
+      /*
+       * Being NULL is valid when called before the work process is launched,
+       * so use INFO instead of ERROR here.
+       */
+      LOG_INFO(mLog, "Worker process is NULL for WTSSessionId:%lu.",
+<span style = "background-color:#fdd">               wtsSessionId);
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return pWorkerProcess-&gt;IsAlive();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::StartWorkerProcess --
+ *
+ *    Spawns a new process for the specified sessionId. If that sessionId
+ *    already has a process associated with it, then just re-use that. So
+ *    this assumes that each wtsSessionId has one process assigned to it
+ *
+ * Results:
+ *    true on success, false on error.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::StartWorkerProcess(DWORD wtsSessionId, // IN
+                                     bool useIPv6)       // IN
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();</span>
+
+<span style = "background-color:#fdd">   if (IsWorkerAlive(wtsSessionId)) {</span>
+      LOG_DEBUG(mLog, "Worker is already alive in WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                wtsSessionId);
+      return true;</span>
+   }
+
+   {
+<span style = "background-color:#fdd">      AbAutoLock al(mPendingSessionsLock);
+      std::ostringstream numQueuedSessions;
+      numQueuedSessions &lt;&lt; mPendingSessions.size();</span>
+      LOG_INFO(mLog, "Request to start worker in WTSSessionID:%lu, "
+<span style = "background-color:#fdd">               "queue size %s.", wtsSessionId, numQueuedSessions.str().c_str());</span>
+      PendingSession item;
+<span style = "background-color:#fdd">      item.wtsSessionId = wtsSessionId;
+      item.useIPv6 = useIPv6;
+      mPendingSessions.push_back(item);
+   }</span>
+
+<span style = "background-color:#fdd">   if (!mMonitorThread) {
+      LOG_DEBUG(mLog, "Creating a new monitoring thread.");</span>
+      mMonitorThread = (HANDLE)_beginthreadex(NULL, 0,
+                                              WorkerSessionMgr::ThreadProc,
+<span style = "background-color:#fdd">                                              this, 0, NULL);
+      if (!mMonitorThread) {</span>
+         LOG_ERROR(mLog, "Failed to start monitoring thread, error:0x%08lx "
+                   "(%I64d ms).", GetLastError(),
+<span style = "background-color:#fdd">                   AbUtil::GetClock64() - startTime);
+         return false;</span>
+      } else {
+<span style = "background-color:#fdd">         LOG_INFO(mLog, "Worker process monitoring thread started.");</span>
+      }
+<span style = "background-color:#fdd">   } else {</span>
+      LOG_DEBUG(mLog, "Monitoring thread exists, so set event to start a new "
+<span style = "background-color:#fdd">                "worker process for WTSSessionID:%lu.", wtsSessionId);
+      SetEvent(mStartWorkerEvent);</span>
+   }
+
+   LOG_DEBUG(mLog, "Worker started successfully for WTSSessionID:%lu "
+<span style = "background-color:#fdd">             "(%I64d ms).", wtsSessionId, AbUtil::GetClock64() - startTime);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::SendMessageToWorker --
+ *
+ *    Sends message through the pipe from service to worker process
+ *    and reads the response.
+ *
+ *    May block up to 10 seconds (default in PipeClient constructor)
+ *    due to retries if worker is not responding.
+ *
+ *    If sending the message to worker fails, and notifyAgentOnFailure is
+ *    set, a session delete message is sent to View Agent.
+ *
+ * Results:
+ *    true on success, false on error.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::SendMessageToWorker(
+                     const std::string&amp; msg,                   // IN
+                     DWORD wtsSessionId,                       // IN
+                     bool bRetry,                              // IN
+                     std::string&amp; response,                    // OUT
+                     const std::string&amp; vAuth  /* = "" */,     // IN
+                     bool notifyAgentOnFailure /* = false */)  // IN
+<span style = "background-color:#fdd">{
+   bool sentMessage = true;
+   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess;</span>
+
+<span style = "background-color:#fdd">   if (bRetry) {</span>
+      /*
+       * maxWaitMSec is configurable because some customer systems have
+       * been seen to take a crazy amount of time to launch a worker.  Bug
+       * 1637325 shows it taking up to 7 seconds.  It's not good to have
+       * this thread sleeping here for that length of time (the default 3
+       * seconds is already bad enough) but restructuring the code to make
+       * the wait asynchronous is non-trivial and high-risk, so we'll stick
+       * with the sleep for now and hopefully do the restructuring later.
+       */
+
+<span style = "background-color:#fdd">      int maxWaitMSec = 3000;</span>
+      static const DWORD retryIntervalMSec = 100;
+      DWORD totalWaited = 0;
+
+      MainAppService::Get()-&gt;GetConfig()-&gt;GetInt(
+<span style = "background-color:#fdd">         CONFIG_MAX_WORKER_STARTUP_WAIT_MSEC, maxWaitMSec);</span>
+      while (true) {
+<span style = "background-color:#fdd">         pWorkerProcess = GetWorkerProcess(wtsSessionId);
+         if (pWorkerProcess) {
+            if (pWorkerProcess-&gt;SendMessageToWorker(msg, response)) {
+               LOG_INFO(mLog, "Sent message %s successfully. ", msg.c_str());
+               break;</span>
+            }
+         }
+
+<span style = "background-color:#fdd">         if (totalWaited &gt;= maxWaitMSec) {
+            sentMessage = false;</span>
+            break;
+         }
+         LOG_INFO(mLog, "Could not connect to worker. Will retry again "
+<span style = "background-color:#fdd">                  "(%lu ms).", totalWaited);
+         Sleep(retryIntervalMSec);
+         totalWaited += retryIntervalMSec;
+      }
+   } else {
+      pWorkerProcess = GetWorkerProcess(wtsSessionId);
+      if (pWorkerProcess) {
+         sentMessage = pWorkerProcess-&gt;SendMessageToWorker(msg, response);</span>
+      } else {
+<span style = "background-color:#fdd">         LOG_ERROR(mLog, "Unable to get worker process instance");
+         sentMessage = false;</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   if (!sentMessage &amp;&amp; notifyAgentOnFailure) {</span>
+      VDPConnectionResult reason = VDPCONNECT_FAILURE;
+      LOG_WARN(mLog, "Failed to send message to worker wtsSessionID:%lu, "
+               "send delete session message for vAuth:%s to agent, "
+               "reason:%d.",
+<span style = "background-color:#fdd">               wtsSessionId, Log_Token(vAuth).c_str(), reason);</span>
+      bool agentSentMessage = SendSessionDeleteMessageToViewAgent(
+                                 vAuth,
+<span style = "background-color:#fdd">                                 reason);
+      if (!agentSentMessage) {</span>
+         LOG_ERROR(mLog, "Failed to sending delete message to agent for "
+                   "vAuth:%s on failed sending message to worker with "
+                   "WTSSessionID:%lu.", Log_Token(vAuth).c_str(),
+<span style = "background-color:#fdd">                   wtsSessionId);</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   return sentMessage;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::SendSessionDeleteMessageToViewAgent --
+ *
+ *    Sends a session delete message to View Agent.
+ *
+ * Results:
+ *    true on success, false on error.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::SendSessionDeleteMessageToViewAgent(
+                     const std::string&amp; vAuth,        // IN
+                     VDPConnectionResult reason)      // IN
+<span style = "background-color:#fdd">{</span>
+   const char * const cmdPrint = pipelib::GetCommandString(
+<span style = "background-color:#fdd">                                    pipelib::ABIPC_SESSION_DELETE_MSG);</span>
+
+<span style = "background-color:#fdd">   if (vAuth.empty()) {</span>
+      LOG_WARN(mLog, "vAuth is empty, command:%s will not be sent to agent.",
+<span style = "background-color:#fdd">               cmdPrint);
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::ostringstream reasonStr;
+   reasonStr &lt;&lt; reason;</span>
+
+<span style = "background-color:#fdd">   std::string msg = pipelib::ABIPC_SESSION_DELETE_MSG;
+   msg += pipelib::ABIPC_MSG_DELIM;
+   msg += vAuth;
+   msg += pipelib::ABIPC_MSG_DELIM;
+   msg += reasonStr.str();</span>
+
+   LOG_DEBUG(mLog, "Sending command:%s to agent for vAuth:%s.",
+<span style = "background-color:#fdd">             cmdPrint, Log_Token(vAuth).c_str());</span>
+
+<span style = "background-color:#fdd">   std::string response = "";
+   bool success = MainAppService::Get()-&gt;SendMessageToViewAgent(msg, response);
+   if (!success) {</span>
+      LOG_ERROR(mLog, "Sending command:%s to agent failed for vAuth:%s.",
+<span style = "background-color:#fdd">                cmdPrint, Log_Token(vAuth).c_str());
+   } else {</span>
+      LOG_INFO(mLog, "Sending command:%s to agent succeeded for vAuth:%s.",
+<span style = "background-color:#fdd">               cmdPrint, Log_Token(vAuth).c_str());</span>
+   }
+<span style = "background-color:#fdd">   return success;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::RequestNewToken --
+ *
+ *    Requests new auth token.
+ *
+ * Results:
+ *    true on success, false on error.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::RequestNewToken(const DWORD wtsSessionId,    // IN
+                                  const bool isShadowSession,  // IN
+                                  std::string &amp;workerResponse) // OUT
+<span style = "background-color:#fdd">{
+   std::string cmd = pipelib::ABIPC_NEW_TOKEN_MSG;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += isShadowSession ? "1" : "0";</span>
+
+   // Ask worker for a new token
+<span style = "background-color:#fdd">   return SendMessageToWorker(cmd, wtsSessionId, true, workerResponse);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::TerminateSession --
+ *
+ *    Terminates the session associated with the auth token.
+ *
+ * Results:
+ *    true on success, false on error.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::TerminateSession(const std::string &amp;vAuth)   // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   std::string msgCmd = pipelib::ABIPC_STOP_SESSION;
+   std::string cmd = msgCmd;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += vAuth;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   std::ostringstream s;
+   s &lt;&lt; VDPCONNECT_CONNECTION_LOST;
+   cmd += s.str();</span>
+
+<span style = "background-color:#fdd">   DWORD wtsSessionId = GetWTSSessionId(vAuth);
+   if (wtsSessionId == INVALID_TS_SESSION_ID) {</span>
+      LOG_ERROR(mLog, "Could not find valid session, nothing to do. "
+                      "vAuth:%s, WTSSessionID:%lu.",
+<span style = "background-color:#fdd">                      Log_Token(vAuth).c_str(), wtsSessionId);
+      return false;</span>
+   }
+
+   LOG_INFO(mLog, "Ask worker to stop the session, vAuth:%s, WTSSessionID:%lu.",
+<span style = "background-color:#fdd">            Log_Token(vAuth).c_str(), wtsSessionId);</span>
+
+<span style = "background-color:#fdd">   std::string response = "";</span>
+   if (!SendMessageToWorker(cmd, wtsSessionId, false,
+<span style = "background-color:#fdd">                            response, vAuth, true)) {</span>
+      LOG_ERROR(mLog, "Failed sending command:%s for vAuth:%s to worker.",
+                pipelib::GetCommandString(msgCmd),
+<span style = "background-color:#fdd">                Log_Token(vAuth).c_str());
+      return false;
+   } else if (response.empty()) {</span>
+      LOG_ERROR(mLog, "Succeeded sending command:%s for vAuth:%s to worker, "
+                "but response was empty.",
+                pipelib::GetCommandString(msgCmd),
+<span style = "background-color:#fdd">                Log_Token(vAuth).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   PurgeSession(vAuth, true);</span>
+
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "End: success, response %s", response.c_str());</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::PurgeSession --
+ *
+ *    Purges the session associated with the vAuth.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WorkerSessionMgr::PurgeSession(const std::string &amp;vAuth,  // IN
+                               bool bKeepWorkerMap)       // IN
+<span style = "background-color:#dfd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#dfd">   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess = GetWorkerProcess(vAuth);
+   if (!pWorkerProcess) {</span>
+<span style = "background-color:#fdd">      LOG_INFO(mLog, "Worker process has already been purged.");
+      return;</span>
+   }
+
+   LOG_INFO(mLog, "Purging worker process with vAuth:%s.",
+<span style = "background-color:#dfd">            Log_Token(vAuth).c_str());</span>
+
+<span style = "background-color:#dfd">   if (!bKeepWorkerMap) {</span>
+      LOG_INFO(mLog, "Erasing worker process from map for vAuth:%s.",
+<span style = "background-color:#dfd">               Log_Token(vAuth).c_str());
+      mWorkerProcessMap.erase(vAuth);
+   } else {</span>
+      LOG_INFO(mLog, "Keeping worker process in the map for vAuth:%s.",
+<span style = "background-color:#fdd">               Log_Token(vAuth).c_str());</span>
+   }
+
+<span style = "background-color:#dfd">   if (!pWorkerProcess-&gt;RemoveActiveSession(vAuth)) {
+      LOG_ERROR(mLog, "Failed to remove the active vAuth.");</span>
+   }
+<span style = "background-color:#dfd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::GetWorkerProcess --
+ *
+ *    Gets the WorkerProcess instance from the map by WTS session id or vAuth.
+ *
+ * Results:
+ *    The shared pointer of the WorkerProcess instance or NULL.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+boost::shared_ptr&lt;WorkerProcess&gt;
+WorkerSessionMgr::GetWorkerProcess(const std::string &amp;key)  // IN
+<span style = "background-color:#dfd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#dfd">   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess;</span>
+   std::map&lt;std::string,
+            boost::shared_ptr&lt;WorkerProcess&gt;&gt;::const_iterator iter =
+<span style = "background-color:#dfd">      mWorkerProcessMap.find(key);
+   if (iter != mWorkerProcessMap.end()) {
+      pWorkerProcess = iter-&gt;second;</span>
+   }
+
+<span style = "background-color:#dfd">   return pWorkerProcess;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::GetWorkerProcess --
+ *
+ *    Gets the WorkerProcess instance from the map by wtsSessionId.
+ *
+ * Results:
+ *    The shared pointer of the WorkerProcess instance or false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+boost::shared_ptr&lt;WorkerProcess&gt;
+WorkerSessionMgr::GetWorkerProcess(DWORD wtsSessionId)  // IN
+<span style = "background-color:#dfd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#dfd">   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess;</span>
+   std::map&lt;std::string,
+            boost::shared_ptr&lt;WorkerProcess&gt;&gt;::const_iterator iter =
+<span style = "background-color:#dfd">      mWorkerProcessMap.find(ToString(wtsSessionId));
+   if (iter != mWorkerProcessMap.end()) {
+      pWorkerProcess = iter-&gt;second;</span>
+   }
+
+<span style = "background-color:#dfd">   return pWorkerProcess;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::GetSessionsCount --
+ *
+ *    Gets the count of the sessions to the workers.
+ *
+ * Results:
+ *    The count of sessions.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::size_t
+WorkerSessionMgr::GetSessionsCount()
+<span style = "background-color:#dfd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#dfd">   return mWorkerProcessMap.size() - mWorkerIds.size();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::IsActiveSession --
+ *
+ *    Checks if the session associated with the vAuth is active.
+ *
+ * Results:
+ *    True if the session is active, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::IsActiveSession(const std::string &amp;vAuth)   // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess =
+<span style = "background-color:#fdd">      GetWorkerProcess(vAuth);
+   if (!pWorkerProcess) {</span>
+      LOG_INFO(mLog, "Worker process is NULL for vAuth:%s.",
+<span style = "background-color:#fdd">               Log_Token(vAuth).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return pWorkerProcess-&gt;IsActiveSession(vAuth);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::GetWTSSessionId --
+ *
+ *    Gets the session id by the given vAuth.
+ *
+ * Results:
+ *    The session id or INVALID_TS_SESSION_ID.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DWORD
+WorkerSessionMgr::GetWTSSessionId(const std::string &amp;vAuth) // IN
+<span style = "background-color:#dfd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess =
+<span style = "background-color:#dfd">      GetWorkerProcess(vAuth);
+   if (!pWorkerProcess) {</span>
+      LOG_ERROR(mLog, "Worker process is unexpectedly NULL for vAuth:%s.",
+<span style = "background-color:#dfd">                Log_Token(vAuth).c_str());
+      return INVALID_TS_SESSION_ID;</span>
+   }
+
+<span style = "background-color:#dfd">   return pWorkerProcess-&gt;GetWTSSessionId();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::GetPrimaryVAuth --
+ *
+ *    Gets the primary vAuth by the given WTS session id.
+ *
+ * Results:
+ *    The primary vAuth.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+WorkerSessionMgr::GetPrimaryVAuth(DWORD wtsSessionId) // IN
+<span style = "background-color:#dfd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess =
+<span style = "background-color:#dfd">      GetWorkerProcess(wtsSessionId);
+   if (!pWorkerProcess) {</span>
+      LOG_ERROR(mLog, "Worker process is unexpectedly NULL for "
+<span style = "background-color:#dfd">                "WTSSessionID:%lu.", WTSSessionId);
+      return std::string();</span>
+   }
+
+<span style = "background-color:#dfd">   return pWorkerProcess-&gt;GetPrimaryVAuth();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::AddActiveSession --
+ *
+ *    Adds the vAuth to indicate an active session.
+ *
+ * Results:
+ *    True on success, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::AddActiveSession(const std::string &amp;vAuth)  // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess = GetWorkerProcess(vAuth);</span>
+
+<span style = "background-color:#fdd">   if (!pWorkerProcess) {
+      LOG_ERROR(mLog, "Worker process is unexpectedly NULL.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return pWorkerProcess-&gt;AddActiveSession(vAuth);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::MapVAuthToWorkerProcess --
+ *
+ *    Maps the vAuth to the WorkerProcess instance associated with the
+ *    given session id.
+ *    We need to distinguish the primary vAuth from the shadow sessions.
+ *
+ * Results:
+ *    True on success, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::MapVAuthToWorkerProcess(DWORD wtsSessionId,        // IN
+                                          const std::string &amp;vAuth,  // IN
+                                          bool isPrimaryToken)       // IN
+<span style = "background-color:#dfd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+   boost::shared_ptr&lt;WorkerProcess&gt; pWorkerProcess =
+<span style = "background-color:#dfd">      GetWorkerProcess(wtsSessionId);</span>
+
+<span style = "background-color:#dfd">   if (!pWorkerProcess) {
+      LOG_ERROR(mLog, "Worker process is unexpectedly NULL.");
+      return false;</span>
+   }
+
+<span style = "background-color:#dfd">   mWorkerProcessMap[vAuth] = pWorkerProcess;</span>
+
+<span style = "background-color:#dfd">   if (isPrimaryToken) {
+      pWorkerProcess-&gt;SetPrimaryVAuth(vAuth);</span>
+   }
+
+<span style = "background-color:#dfd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::GetWTSSessionId --
+ *
+ *    Gets WTS session id for the worker process handle.
+ *
+ * Results:
+ *    wtsSessionId or INVALID_TS_SESSION_ID.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DWORD
+WorkerSessionMgr::GetWTSSessionId(HANDLE workerProcessHandle)  // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+   for(std::map&lt;std::string, boost::shared_ptr&lt;WorkerProcess&gt;&gt;::const_iterator
+<span style = "background-color:#fdd">          iter = mWorkerProcessMap.begin();</span>
+       iter != mWorkerProcessMap.end();
+<span style = "background-color:#fdd">       ++iter) {
+      if ((iter-&gt;second)-&gt;GetWorkerProcessHandle() == workerProcessHandle) {
+         return atoi((iter-&gt;first).c_str());</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   return INVALID_TS_SESSION_ID;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::AddPrimaryWebSocket --
+ *
+ *    Adds the primary websocket to the UDP specific map.
+ *
+ * Results:
+ *    True if successful, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WorkerSessionMgr::AddPrimaryWebSocket(
+   boost::shared_ptr&lt;http2::IWebSocket&gt; primaryWebSocket)  // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   if (NULL == primaryWebSocket) {
+      LOG_ERROR(mLog, "The primary websocket is unexpectedly NULL.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::string vAuth = primaryWebSocket-&gt;GetVAuth();
+   mPrimaryWebSocketMap[vAuth] = primaryWebSocket;</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WorkerSessionMgr::GetPrimaryWebSocket --
+ *
+ *    Gets the primary websocket stored for the given vAuth.
+ *    Note that this is only for UDP
+ *
+ * Results:
+ *    The shared pointer of the primary websocket or NULL.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+boost::shared_ptr&lt;http2::IWebSocket&gt;
+WorkerSessionMgr::GetPrimaryWebSocket(const std::string &amp;vAuth) // IN
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   boost::shared_ptr&lt;http2::IWebSocket&gt; pWebSocket;</span>
+   std::map&lt;std::string,
+            boost::shared_ptr&lt;http2::IWebSocket&gt;&gt;::const_iterator iter =
+<span style = "background-color:#fdd">               mPrimaryWebSocketMap.find(vAuth);
+   if (iter != mPrimaryWebSocketMap.end()) {
+      pWebSocket = iter-&gt;second;</span>
+   }
+
+<span style = "background-color:#fdd">   return pWebSocket;
+}</span></pre>
+	</body>
+</html>

@@ -1,0 +1,262 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>handlerimpl.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2011-2015 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * HandlerImpl.cpp --
+ *
+ *    Implements all HTTP endpoints and request verbs supported by our HTTP
+ *    backend other than appblast protocol.
+ */
+
+#include &lt;Windows.h&gt;
+#include &lt;Winhttp.h&gt;
+
+// appblast/common
+#include "appBlastUtil.h"
+
+// appblast/service
+#include "MainAppService.h"
+#include "HandlerImpl.h"
+
+<span style = "background-color:#dfd">static const std::string LOG_NAME = "handlerImpl";</span>
+
+
+/*-----------------------------------------------------------------------------
+ *
+ * HandlerImpl::HandlerImpl
+ *
+ *    Constructor for HandlerImpl class.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+HandlerImpl::HandlerImpl()
+<span style = "background-color:#fdd">{
+   SetLogger(log4cxx::Logger::getLogger(LOG_NAME));
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HandlerImpl::HandleGet
+ *
+ *    A method that handles HTTP GET request that is not related to AppBlast
+ *    remoting protocol.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+HandlerImpl::HandleGet(ClientRequest* cp)    // IN
+<span style = "background-color:#fdd">{
+   LOG_INFO(mLog, "Handling GET");
+   if (cp == NULL) {
+      LOG_ERROR(mLog, "Invalid argument");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   IHttpResponse *response = cp-&gt;GetResponse();
+   std::string errMsg;
+   std::string requestedPath = cp-&gt;GetRequestPath();
+   LOG_INFO(mLog, "RequestedPath: %s", requestedPath.c_str());
+   if (requestedPath.empty()) {</span>
+      response-&gt;RespondWithText(IHttpResponse::BAD_REQUEST, "",
+<span style = "background-color:#fdd">                                "ERR:bad path");
+      return false;</span>
+   }
+
+   /*
+    * Requests for resources in the js/, locale/, css/ and img/ absolute paths
+    * resolve to the file system. AppBlast.exe reads content from files in
+    * these directories and sends it to the client with proper MIME type,
+    * Content-Length, etc.
+    */
+<span style = "background-color:#fdd">   bool isHtml = AbUtil::HasSuffix(requestedPath.c_str(), ".html");</span>
+   if (isHtml || requestedPath.compare(0, 3, "js/")  == 0
+              || requestedPath.compare(0, 7, "locale/") == 0
+              || requestedPath.compare(0, 4, "css/") == 0
+<span style = "background-color:#fdd">              || requestedPath.compare(0, 4, "img/") == 0) {</span>
+      // Resolve tags for HTML document requests
+<span style = "background-color:#fdd">      ServeFile(*cp, requestedPath, cp-&gt;GetFullUrl());
+      return false;</span>
+   }
+
+   /*
+    * This old class doesn't return a boolean to indicate if it handled
+    * the request or not, so log failures here (instead of being able to
+    * let the request dispatcher do it).
+    */
+   LOG_WARN(mLog, "GET request for missing resource %s (origin %s)",
+                  requestedPath.c_str(),
+<span style = "background-color:#fdd">                  cp-&gt;GetOrigin().c_str());</span>
+
+   // Request wasn't for a resource in the named paths. Die
+   response-&gt;RespondWithText(
+      IHttpResponse::HttpStatusCode(HTTP_STATUS_NOT_FOUND), "",
+<span style = "background-color:#fdd">      "File not found");</span>
+
+<span style = "background-color:#fdd">   return false;
+}</span>
+
+
+/*
+ *------------------------------------------------------------------------------
+ *
+ * HandlerImpl::ServeFile
+ *
+ *    A method that resolves a request for a file, reads the contents of the
+ *    file and transmits those contents to the connected client.
+ *
+ * Results:
+ *    true on success, false if a failure occured.
+ *
+ *------------------------------------------------------------------------------
+ */
+
+bool
+HandlerImpl::ServeFile(const ClientRequest&amp; cp,          // IN: context
+                       const std::string &amp;absolutePath,  // IN:
+                       const std::string &amp;fullUrl)       // IN: only used if shouldResolveTags is true
+<span style = "background-color:#fdd">{
+   IHttpResponse *response = cp.GetResponse();</span>
+
+   /*
+    * All file-based requests to AppBlast are assumed relative to the installation
+    * directory of AppBlast. Use a simple append to concatenate the absolutePath
+    * of the request onto the installed directory name of AppBlast.exe to form the
+    * full path name of the local resource to be served.
+    */
+
+<span style = "background-color:#fdd">   std::wstring sFullPathName;
+   if (!AbUtil::GetInstalledPath(sFullPathName)) {
+      ASSERT(0);    // GetInstallPath not expected to fail</span>
+      std::string msg =
+         "&lt;html&gt;&lt;body&gt;&lt;h1&gt;500 - INTERNAL SERVER ERROR&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;";
+      response-&gt;SendHttpResponse(IHttpResponse::INTERNAL_SERVER_ERROR,
+                                 "",
+                                 msg.c_str(),
+                                 msg.size(),
+                                 "text/html");
+      return false;
+   }
+
+   // ALL web resources must be in web.
+<span style = "background-color:#fdd">   sFullPathName.append(L"web\\");</span>
+
+<span style = "background-color:#fdd">   sFullPathName.append(AbUtil::CharToWide(absolutePath));</span>
+
+   // Prevent directory traversal.
+<span style = "background-color:#fdd">   if (absolutePath.find("..") != std::string::npos) {
+      response-&gt;RespondWithText(IHttpResponse::BAD_REQUEST, "", "ERR:bad path");
+      return false;</span>
+   }
+
+   /*
+    * Open and determine the size of the local resource to be served to the client.
+    * Open using wide char version so non-ASCII chars in the file path are supported.
+    *
+    * PR 876699
+    */
+<span style = "background-color:#fdd">   FILE* f = NULL;
+   if (!f &amp;&amp; _wfopen_s(&amp;f, sFullPathName.c_str(), L"rb, ccs=UTF-8")) {</span>
+      std::string msg =
+<span style = "background-color:#fdd">         "&lt;html&gt;&lt;body&gt;&lt;h1&gt;404 - FILE NOT FOUND&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;";</span>
+      response-&gt;SendHttpResponse(IHttpResponse::NOT_FOUND,
+                                 "",
+                                 msg.c_str(),
+                                 msg.size(),
+<span style = "background-color:#fdd">                                 "text/html");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   fseek(f, 0, SEEK_END);
+   long size = ftell(f);
+   fseek(f, 0, SEEK_SET);</span>
+
+   // Determine the MIME type of the requested resource.
+<span style = "background-color:#fdd">   const char* mime = "text/plain";
+   std::string::size_type idx = absolutePath.find_last_of(".");
+   if (idx != std::string::npos) {
+      ++idx; // skip the period
+      if (absolutePath.compare(idx, 2, "js") == 0) {
+         mime = "text/javascript";
+      } else if (absolutePath.compare(idx, 4, "json") == 0) {
+         mime = "application/json";
+      } else if (absolutePath.compare(idx, 3, "css") == 0) {
+         mime = "text/css";
+      } else if (absolutePath.compare(idx, 3, "png") == 0) {
+         mime = "image/png";
+      } else if (absolutePath.compare(idx, 3, "ico") == 0) {
+         mime = "image/ico";
+      } else if ((absolutePath.compare(idx, 3, "jpg") == 0) ||
+                 (absolutePath.compare(idx, 4, "jpeg") == 0)) {
+         mime = "image/jpeg";
+      } else if (absolutePath.compare(idx, 4, "html") == 0) {
+         mime = "text/html";</span>
+      }
+      // else, fall through with mime set to "text/pain" (default)
+   }
+
+   // Allocate a local buffer to receive the local resource into memory.
+<span style = "background-color:#fdd">   char* buffer = (char*)malloc(size + 1);
+   if (buffer == NULL) {</span>
+      std::string msg =
+<span style = "background-color:#fdd">         "&lt;html&gt;&lt;body&gt;&lt;h1&gt;500 - INTERNAL SERVER ERROR&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;";</span>
+      response-&gt;SendHttpResponse(IHttpResponse::INTERNAL_SERVER_ERROR,
+                                 "",
+                                 msg.c_str(),
+                                 msg.size(),
+<span style = "background-color:#fdd">                                 "text/html");
+      fclose(f);
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   buffer[size] = 0;</span>
+
+   // Read the resource into the buffer and serve it to the client.
+<span style = "background-color:#fdd">   if (fread(buffer, (size_t)size, 1, f) != 1) {
+      fclose(f);
+      f = NULL;</span>
+
+<span style = "background-color:#fdd">      free(buffer);</span>
+      buffer = NULL;
+
+      std::string msg =
+<span style = "background-color:#fdd">         "&lt;html&gt;&lt;body&gt;&lt;h1&gt;500 - INTERNAL SERVER ERROR&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;";</span>
+      response-&gt;SendHttpResponse(IHttpResponse::INTERNAL_SERVER_ERROR,
+                                 "",
+                                 msg.c_str(),
+                                 msg.size(),
+<span style = "background-color:#fdd">                                 "text/html");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   fclose(f);
+   f = NULL;</span>
+
+<span style = "background-color:#fdd">   response-&gt;SendHttpResponse(IHttpResponse::OK, "", buffer, size, mime);</span>
+
+<span style = "background-color:#fdd">   free(buffer);</span>
+   buffer = NULL;
+<span style = "background-color:#fdd">   return true;
+}</span></pre>
+	</body>
+</html>

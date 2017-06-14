@@ -1,0 +1,112 @@
+
+C:\project-cbtm\Jenkins Commands>rm -R C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\codecoverage -f 
+
+C:\project-cbtm\Jenkins Commands>cd C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ 
+Running main() from gtest_main.cc
+Note: Google Test filter = WorkerSessionMgrTest.MultithreadedTestAPI
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WorkerSessionMgrTest
+[ RUN      ] WorkerSessionMgrTest.MultithreadedTestAPI
+[       OK ] WorkerSessionMgrTest.MultithreadedTestAPI (398 ms)
+[----------] 1 test from WorkerSessionMgrTest (398 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (398 ms total)
+[  PASSED  ] 1 test.
+Running main() from gtest_main.cc
+Note: Google Test filter = WorkerSessionMgrTest.RecordAndValidateMapData
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WorkerSessionMgrTest
+[ RUN      ] WorkerSessionMgrTest.RecordAndValidateMapData
+[       OK ] WorkerSessionMgrTest.RecordAndValidateMapData (207 ms)
+[----------] 1 test from WorkerSessionMgrTest (207 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (207 ms total)
+[  PASSED  ] 1 test.
+Running main() from gtest_main.cc
+Note: Google Test filter = AuthenticationMgrTest.InvalidateAuthenticationTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from AuthenticationMgrTest
+[ RUN      ] AuthenticationMgrTest.InvalidateAuthenticationTest
+[       OK ] AuthenticationMgrTest.InvalidateAuthenticationTest (224 ms)
+[----------] 1 test from AuthenticationMgrTest (224 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (224 ms total)
+[  PASSED  ] 1 test.
+Running main() from gtest_main.cc
+Note: Google Test filter = AuthenticationMgrTest.NewAuthenticationTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from AuthenticationMgrTest
+[ RUN      ] AuthenticationMgrTest.NewAuthenticationTest
+[       OK ] AuthenticationMgrTest.NewAuthenticationTest (223 ms)
+[----------] 1 test from AuthenticationMgrTest (223 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (223 ms total)
+[  PASSED  ] 1 test.
+Running main() from gtest_main.cc
+Note: Google Test filter = AuthenticationMgrTest.ProcessAuthenticationRequestTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from AuthenticationMgrTest
+[ RUN      ] AuthenticationMgrTest.ProcessAuthenticationRequestTest
+[       OK ] AuthenticationMgrTest.ProcessAuthenticationRequestTest (228 ms)
+[----------] 1 test from AuthenticationMgrTest (228 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (228 ms total)
+[  PASSED  ] 1 test.
+Running main() from gtest_main.cc
+Note: Google Test filter = EncoderMgrTest.CompleteReadTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from EncoderMgrTest
+[ RUN      ] EncoderMgrTest.CompleteReadTest
+[       OK ] EncoderMgrTest.CompleteReadTest (198 ms)
+[----------] 1 test from EncoderMgrTest (198 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (206 ms total)
+[  PASSED  ] 1 test.
+Running main() from gtest_main.cc
+Note: Google Test filter = EncoderMgrTest.HeartbeatTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from EncoderMgrTest
+[ RUN      ] EncoderMgrTest.HeartbeatTest
+[       OK ] EncoderMgrTest.HeartbeatTest (195 ms)
+[----------] 1 test from EncoderMgrTest (195 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (203 ms total)
+[  PASSED  ] 1 test.
+Running main() from gtest_main.cc
+Note: Google Test filter = VideoMgrTest.createVideoMgr
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from VideoMgrTest
+[ RUN      ] VideoMgrTest.createVideoMgr
+[       OK ] VideoMgrTest.createVideoMgr (2 ms)
+[----------] 1 test from VideoMgrTest (3 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (10 ms total)
+[  PASSED  ] 1 test.
+Running main() from gtest_main.cc
+Note: Google Test filter = VideoMgrTest.getFBAddress
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from VideoMgrTest
+[ RUN      ] VideoMgrTest.getFBAddress
+[       OK ] VideoMgrTest.getFBAddress (3 ms)
+[----------] 1 test from VideoMgrTest (3 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (10 ms total)
+[  PASSED  ] 1 test.

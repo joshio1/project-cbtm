@@ -1,0 +1,215 @@
+'Workspace is C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64'
+Running main() from gtest_main.cc
+ConnectionCtrlTest.
+ConnectionCtrlTest.NullInitialize
+Running main() from gtest_main.cc
+Note: Google Test filter = ConnectionCtrlTest.NullInitialize
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from ConnectionCtrlTest
+[ RUN      ] ConnectionCtrlTest.NullInitialize
+[       OK ] ConnectionCtrlTest.NullInitialize (8 ms)
+[----------] 1 test from ConnectionCtrlTest (8 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (8 ms total)
+[  PASSED  ] 1 test.
+ConnectionCtrlMgrTest.
+ConnectionCtrlMgrTest.NullInitialize
+Running main() from gtest_main.cc
+Note: Google Test filter = ConnectionCtrlMgrTest.NullInitialize
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from ConnectionCtrlMgrTest
+[ RUN      ] ConnectionCtrlMgrTest.NullInitialize
+[       OK ] ConnectionCtrlMgrTest.NullInitialize (8 ms)
+[----------] 1 test from ConnectionCtrlMgrTest (8 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (8 ms total)
+[  PASSED  ] 1 test.
+AuthenticateMgrTest.
+AuthenticateMgrTest.NullInitialize
+Running main() from gtest_main.cc
+Note: Google Test filter = AuthenticateMgrTest.NullInitialize
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from AuthenticateMgrTest
+[ RUN      ] AuthenticateMgrTest.NullInitialize
+[       OK ] AuthenticateMgrTest.NullInitialize (7 ms)
+[----------] 1 test from AuthenticateMgrTest (7 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (7 ms total)
+[  PASSED  ] 1 test.
+AuthenticateMgrTest.AuthenticateWithoutInitialize
+Running main() from gtest_main.cc
+Note: Google Test filter = AuthenticateMgrTest.AuthenticateWithoutInitialize
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from AuthenticateMgrTest
+[ RUN      ] AuthenticateMgrTest.AuthenticateWithoutInitialize
+[       OK ] AuthenticateMgrTest.AuthenticateWithoutInitialize (8 ms)
+[----------] 1 test from AuthenticateMgrTest (8 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (8 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.
+WinEventCatcherTest.InitializationTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.InitializationTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.InitializationTest
+[       OK ] WinEventCatcherTest.InitializationTest (8 ms)
+[----------] 1 test from WinEventCatcherTest (8 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (8 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.GetNextEmptyTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.GetNextEmptyTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.GetNextEmptyTest
+[       OK ] WinEventCatcherTest.GetNextEmptyTest (7 ms)
+[----------] 1 test from WinEventCatcherTest (7 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (7 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.AddRemoveOneTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.AddRemoveOneTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.AddRemoveOneTest
+[       OK ] WinEventCatcherTest.AddRemoveOneTest (9 ms)
+[----------] 1 test from WinEventCatcherTest (9 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (9 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.AddRemoveDupTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.AddRemoveDupTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.AddRemoveDupTest
+[       OK ] WinEventCatcherTest.AddRemoveDupTest (8 ms)
+[----------] 1 test from WinEventCatcherTest (8 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (9 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.AddRemoveMultipleTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.AddRemoveMultipleTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.AddRemoveMultipleTest
+[       OK ] WinEventCatcherTest.AddRemoveMultipleTest (8 ms)
+[----------] 1 test from WinEventCatcherTest (8 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (8 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.SignalPollCollectTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.SignalPollCollectTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.SignalPollCollectTest
+[       OK ] WinEventCatcherTest.SignalPollCollectTest (110 ms)
+[----------] 1 test from WinEventCatcherTest (110 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (110 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.SignalWaitCollectTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.SignalWaitCollectTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.SignalWaitCollectTest
+[       OK ] WinEventCatcherTest.SignalWaitCollectTest (8 ms)
+[----------] 1 test from WinEventCatcherTest (8 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (8 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.SignalWaitCollectMultipleTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.SignalWaitCollectMultipleTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.SignalWaitCollectMultipleTest
+[       OK ] WinEventCatcherTest.SignalWaitCollectMultipleTest (208 ms)
+[----------] 1 test from WinEventCatcherTest (208 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (209 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.SignalWaitCollectManyTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.SignalWaitCollectManyTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.SignalWaitCollectManyTest
+[       OK ] WinEventCatcherTest.SignalWaitCollectManyTest (212 ms)
+[----------] 1 test from WinEventCatcherTest (212 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (212 ms total)
+[  PASSED  ] 1 test.
+WinEventCatcherTest.SignalWaitCollectMegaTest
+Running main() from gtest_main.cc
+Note: Google Test filter = WinEventCatcherTest.SignalWaitCollectMegaTest
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WinEventCatcherTest
+[ RUN      ] WinEventCatcherTest.SignalWaitCollectMegaTest
+[       OK ] WinEventCatcherTest.SignalWaitCollectMegaTest (1895 ms)
+[----------] 1 test from WinEventCatcherTest (1895 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (1896 ms total)
+[  PASSED  ] 1 test.
+WorkerSessionMgrTest.
+WorkerSessionMgrTest.MultithreadedTestAPI
+Running main() from gtest_main.cc
+Note: Google Test filter = WorkerSessionMgrTest.MultithreadedTestAPI
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WorkerSessionMgrTest
+[ RUN      ] WorkerSessionMgrTest.MultithreadedTestAPI
+[       OK ] WorkerSessionMgrTest.MultithreadedTestAPI (390 ms)
+[----------] 1 test from WorkerSessionMgrTest (390 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (390 ms total)
+[  PASSED  ] 1 test.
+WorkerSessionMgrTest.RecordAndValidateMapData
+Running main() from gtest_main.cc
+Note: Google Test filter = WorkerSessionMgrTest.RecordAndValidateMapData
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from WorkerSessionMgrTest
+[ RUN      ] WorkerSessionMgrTest.RecordAndValidateMapData
+[       OK ] WorkerSessionMgrTest.RecordAndValidateMapData (184 ms)
+[----------] 1 test from WorkerSessionMgrTest (184 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (184 ms total)
+[  PASSED  ] 1 test.

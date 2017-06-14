@@ -1,0 +1,696 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>connectionctrl.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2014-2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * ConnectionCtrl.cpp --
+ *
+ *    Controller for handling everything for the current connection.
+ */
+
+// appblast/pipelib
+#include "PipeCommon.h"
+
+// appblast/common
+#include "ConsoleState.h"
+#include "IWebSocket.h"
+
+// appblast/service
+#include "ConnectionCtrl.h"
+#include "include/IWorkerSessionMgr.h"
+
+extern "C" {
+   #include "VMwareVDPPlugin.h"
+}
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::Create --
+ *
+ *      Create a new instance of ConnectionCtrl.
+ *
+ * Results:
+ *      New ConnectionCtrl instance.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+IConnectionCtrl*
+ConnectionCtrl::Create()
+{
+   return new ConnectionCtrl();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::ConnectionCtrl
+ *
+ *    Constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+ConnectionCtrl::ConnectionCtrl()
+   : mLog(log4cxx::Logger::getLogger("connectionctrl")),
+     mWorkerSessionMgr(NULL)
+<span style = "background-color:#fdd">{
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::~ConnectionCtrl
+ *
+ *    Destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+ConnectionCtrl::~ConnectionCtrl()
+<span style = "background-color:#fdd">{
+   LOG_DEBUG(mLog, "Destructor called.");
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::Initialize
+ *
+ *    Perform any needed initialization.
+ *
+ * Results:
+ *    true if the initialization succeeded, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::Initialize(IWorkerSessionMgr* pWorkerSessionMgr)        // IN
+<span style = "background-color:#fdd">{
+   if (pWorkerSessionMgr == NULL) {
+      LOG_ERROR(mLog, "NULL WorkerIPC interface pointer");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   mWorkerSessionMgr = pWorkerSessionMgr;
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::Release
+ *
+ *    Perform any needed cleanup.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+ConnectionCtrl::Release()
+<span style = "background-color:#fdd">{</span>
+   /*
+    * Don't delete (just set to NULL), since we are just passed the interfaces
+    * in Initialize and we don't own the objects
+    */
+<span style = "background-color:#fdd">   mWorkerSessionMgr = NULL;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::OnClientConnectCompleted --
+ *
+ *    Notification that we have successfully completed a connection.
+ *
+ * Results:
+ *    true if success, false otherwise
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::OnClientConnectCompleted(http2::IWebSocket* webSocket) //IN
+<span style = "background-color:#fdd">{</span>
+   /*
+    * Since a new websocket instance is created in mLoopbackWebSocket, via
+    * CreateAndMapDataChannelWithWorker(), and because we are manipulating
+    * mLoopbackWebSocket, make sure we don't allow any other connection to
+    * modify this until we are done with it.
+    */
+   //boost::recursive_mutex::scoped_lock guard(mLock);
+
+<span style = "background-color:#fdd">   if (webSocket == NULL) {
+      LOG_ERROR(mLog, "IWebSocket object was NULL");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "IWebSocket %p", webSocket);</span>
+
+<span style = "background-color:#fdd">   mClientFacingWebSocket.reset(webSocket);</span>
+
+<span style = "background-color:#fdd">   return DoClientConnectCompleted();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::OnClientConnectCompleted --
+ *
+ *    Notification that we have successfully completed a connection.
+ *
+ * Results:
+ *    true if success, false otherwise
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::OnClientConnectCompleted(boost::shared_ptr&lt;http2::IWebSocket&gt; \
+                                         webSocket) // IN
+<span style = "background-color:#fdd">{
+   if (!webSocket) {
+      LOG_ERROR(mLog, "Invalid WebSocket shared pointer.");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "IWebSocket %p", webSocket.get());</span>
+
+<span style = "background-color:#fdd">   mClientFacingWebSocket = webSocket;</span>
+
+<span style = "background-color:#fdd">   return DoClientConnectCompleted();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::OnConnectionError --
+ *
+ *    Notification that the websocket encountered an error. This handles
+ *    both client facing and loopback websockets, and the same as they
+ *    share the same vAuth.
+ *
+ * Results:
+ *    true if success, false otherwise
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::OnConnectionError(const std::string&amp; vAuth)    // IN
+<span style = "background-color:#fdd">{</span>
+   bool bReturn = true;
+
+   /*
+    * Do partial cleanup here, and don't tell worker through PIPE any longer.
+    */
+<span style = "background-color:#fdd">   mWorkerSessionMgr-&gt;PurgeSession(vAuth, true);</span>
+
+   /*
+    * Closes both sockets as a network error happened.
+    * Closing the loopback socket is sufficient to tell worker the connection
+    * has been gone.
+    */
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "Closing Loopback and ClientFacing websockets.");
+   CloseClientFacingWebSocket();
+   CloseLoopbackWebSocket();</span>
+
+<span style = "background-color:#fdd">   return bReturn;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::DoClientConnectCompleted --
+ *
+ *    Do the work related to the connect complete notification.
+ *
+ * Results:
+ *    true if success, false otherwise
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::DoClientConnectCompleted()
+<span style = "background-color:#fdd">{
+   if (!mClientFacingWebSocket) {
+      LOG_ERROR(mLog, "WebSocket shared pointer could not be acquired");
+      return false;</span>
+   }
+
+   // Indicate that this is a client facing connection
+<span style = "background-color:#fdd">   mClientFacingWebSocket-&gt;SetClientFacing(true);
+   mClientFacingWebSocket-&gt;SetConnectionCtrl(shared_from_this());</span>
+
+<span style = "background-color:#fdd">   std::string vAuth = mClientFacingWebSocket-&gt;GetVAuth();</span>
+
+   // Use the vAuth to lookup the WTS session Id.
+<span style = "background-color:#fdd">   DWORD wtsSessionId = mWorkerSessionMgr-&gt;GetWTSSessionId(vAuth);</span>
+   LOG_INFO(mLog, "vAuth saved in the connection is %s, WTSSessionID:%lu.",
+<span style = "background-color:#fdd">            Log_Token(vAuth).c_str(), wtsSessionId);</span>
+
+<span style = "background-color:#fdd">   if (wtsSessionId == INVALID_TS_SESSION_ID) {
+      LOG_ERROR(mLog, "Invalid WTSSessionID, do not connect to the worker");
+      return false;</span>
+   }
+
+   /*
+    * TODO: mLoopbackWebSocket is updated within this function. Try and do
+    * this a little more cleanly.
+    */
+<span style = "background-color:#fdd">   CreateAndMapDataChannelWithWorker(wtsSessionId, mClientFacingWebSocket);</span>
+
+   // The call above must have created the websocket
+<span style = "background-color:#fdd">   if (!mLoopbackWebSocket) {
+      LOG_ERROR(mLog, "Loopback Shared pointer could not be acquired");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   mLoopbackWebSocket-&gt;SetClientFacing(false);
+   mLoopbackWebSocket-&gt;SetConnectionCtrl(shared_from_this());</span>
+
+   // Now make sure the re-direct connections are properly setup
+<span style = "background-color:#fdd">   mClientFacingWebSocket-&gt;SetRedirectWebSocket(mLoopbackWebSocket);
+   mLoopbackWebSocket-&gt;SetRedirectWebSocket(mClientFacingWebSocket);</span>
+   LOG_INFO(mLog, "vAuth %s ClientFacingWS %p LoopbackWS %p",
+            Log_Token(vAuth).c_str(),
+            mClientFacingWebSocket.get(),
+<span style = "background-color:#fdd">            mLoopbackWebSocket.get());</span>
+
+
+<span style = "background-color:#fdd">   http2::IWebSocket *wsClientFacing = mClientFacingWebSocket.get();
+   if (wsClientFacing == NULL) {
+      LOG_ERROR(mLog, "Client facing websocket is NULL");
+      return false;</span>
+   }
+
+   http2::IWebSocket *wsLoopback = mLoopbackWebSocket.get();
+<span style = "background-color:#fdd">   if (wsLoopback == NULL) {
+      LOG_ERROR(mLog, "Loopback websocket is NULL");
+      return false;</span>
+   }
+
+   /*
+    * Wait until the worker is ready (e.g. it has been able to accept the
+    * forwarding websocket) before telling the worker to start a VNC
+    * session.  Without this, there a possibility of a crash during or after
+    * Worker::Connection::Start if it plumbs a VNC session (or VVC) onto the
+    * forwarding websocket before that conduit has been fully initialised.
+    */
+<span style = "background-color:#fdd">   const std::string sessionCookie = wsClientFacing-&gt;GetWebCookie();
+   if (!WaitForWorkerReady(sessionCookie)) {
+      LOG_ERROR(mLog, "Worker did not become ready, so call off the party");
+      CloseClientFacingWebSocket();
+      CloseLoopbackWebSocket();
+      LOG_ERROR(mLog, "WebSockets closed.");
+      return false;</span>
+   }
+
+   bool bResult = DoStartSession(sessionCookie,
+<span style = "background-color:#fdd">                                 wsClientFacing-&gt;GetSubProtocol());
+   if (bResult) {</span>
+      /*
+       * Push() succeeded, meaning that we could authenticate and
+       * could notify the worker to start up its end of the connection.
+       * Queue up async reads on both websockets (the one connected to the
+       * client and the one connected to the worker). Subsequent reads will
+       * be queued from the BufferSent callbacks.
+       */
+<span style = "background-color:#fdd">      mClientFacingWebSocket-&gt;DoReadData();
+      mLoopbackWebSocket-&gt;DoReadData();</span>
+   } else {
+      LOG_ERROR(mLog, "IWebSocket validation failed, "
+<span style = "background-color:#fdd">                "so close the websockets");
+      CloseClientFacingWebSocket();
+      CloseLoopbackWebSocket();
+      LOG_ERROR(mLog, "WebSockets closed.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   bool bRet = mWorkerSessionMgr-&gt;AddActiveSession(vAuth);</span>
+   LOG_INFO(mLog, "Active Session update for vauth %s was %sSuccessful",
+<span style = "background-color:#fdd">            Log_Token(vAuth).c_str(), bRet ? "" : "Not ");</span>
+
+<span style = "background-color:#fdd">   return bRet;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::CreateAndMapDataChannelWithWorker
+ *
+ *    This creates a new connection object, connects it to the worker using
+ *    the loopback socket, and create a new websocket for this connection.
+ *
+ * Results:
+ *    None. TODO: Need to return error codes.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+ConnectionCtrl::CreateAndMapDataChannelWithWorker(const DWORD sessionId, // IN
+                  boost::shared_ptr&lt;http2::IWebSocket&gt; clientFacingWS)   // IN
+<span style = "background-color:#fdd">{
+   if (!clientFacingWS) {
+      LOG_ERROR(mLog, "Invalid Client facing websocket shared pointer.");
+      return;</span>
+   }
+
+   // First find out where we need to connect with the worker
+<span style = "background-color:#fdd">   std::string workerIpString, workerPortString;</span>
+   bool success = DoGetWorkerDataEndpoint(sessionId, workerIpString,
+<span style = "background-color:#fdd">                                          workerPortString);
+   if (!success) {</span>
+      LOG_ERROR(mLog, "Failed to obtain worker data endpoint address for "
+<span style = "background-color:#fdd">                "SessionID:%lu.", sessionId);
+      return;</span>
+   }
+
+   if (!clientFacingWS-&gt;CreateLoopbackWebSocket(sessionId, workerIpString,
+<span style = "background-color:#fdd">                                       workerPortString, mLoopbackWebSocket)) {</span>
+      LOG_ERROR(mLog, "Could not create loopback ws, client facing ws raw %p",
+<span style = "background-color:#fdd">                clientFacingWS.get());
+      return;</span>
+   }
+
+   LOG_INFO(mLog, "Created loopback ws raw %p, client facing ws raw %p",
+<span style = "background-color:#fdd">            mLoopbackWebSocket.get(), clientFacingWS.get());
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::DoGetWorkerReady --
+ *
+ *    Ask the worker whether it is ready to start a session.
+ *
+ *    XXX make this a tri-valued function, so that we can tell the caller
+ *    whether we succeeded, failed because the worker told us that it's not
+ *    ready yet, or failed for some structural reason (like a nonexistent map
+ *    or a bogus sessionToken) that won't be cured by a retry.
+ *
+ * Results:
+ *    true if the worker is ready to start a session, otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::DoGetWorkerReady(const std::string&amp; sessionToken)   // IN
+<span style = "background-color:#fdd">{
+   std::string vAuth = mClientFacingWebSocket-&gt;GetVAuth();
+   DWORD sessionId = mWorkerSessionMgr-&gt;GetWTSSessionId(vAuth);
+   if (sessionId == INVALID_TS_SESSION_ID) {</span>
+      LOG_ERROR(mLog, "Unable to retrieve WTSSessionID for sessionToken %s.",
+<span style = "background-color:#fdd">                Log_Token(sessionToken).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::string workerReadyCmd = pipelib::ABIPC_GET_WORKER_READY;
+   std::string cmd = workerReadyCmd;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += sessionToken;</span>
+
+<span style = "background-color:#fdd">   std::string response = "";</span>
+   if (!mWorkerSessionMgr-&gt;SendMessageToWorker(cmd, sessionId,
+<span style = "background-color:#fdd">                                               false, response)) {</span>
+      LOG_ERROR(mLog, "Failed sending command:%s for sessionToken:%s to "
+                "worker.", pipelib::GetCommandString(workerReadyCmd),
+<span style = "background-color:#fdd">                Log_Token(sessionToken).c_str());
+      return false;
+   } else if (response.empty()) {</span>
+      LOG_ERROR(mLog, "Succeeded sending command:%s for sessionToken:%s to "
+                "worker, but response was empty.",
+                pipelib::GetCommandString(workerReadyCmd),
+<span style = "background-color:#fdd">                Log_Token(sessionToken).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return response == "Y";
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::WaitForWorkerReady
+ *
+ *    Wait for a reasonable interval for the worker to indicate that it is
+ *    ready to handle a Blast session.
+ *
+ * Results:
+ *    true if the worker says it's ready within the allowed interval,
+ *    otherwise false.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::WaitForWorkerReady(const std::string &amp;sessionCookie)
+<span style = "background-color:#fdd">{</span>
+
+   static const DWORD maxWait = 5000;        // millisecs
+   static const DWORD reAskInterval = 100;   // millisecs
+
+<span style = "background-color:#fdd">   DWORD totalWaited = 0;</span>
+   bool retval = true;
+
+<span style = "background-color:#fdd">   while (!DoGetWorkerReady(sessionCookie)) {
+      if (totalWaited &gt;= maxWait) {</span>
+         retval = false;
+         break;
+      }
+<span style = "background-color:#fdd">      Sleep(reAskInterval);
+      totalWaited += reAskInterval;</span>
+   }
+
+   if (retval) {
+      LOG_DEBUG(mLog, "Worker for cookie:%s is ready (%lu ms).",
+<span style = "background-color:#fdd">                Log_Token(sessionCookie).c_str(), totalWaited);
+   } else {</span>
+      LOG_ERROR(mLog, "Worker for cookie:%s is not ready (%lu ms).",
+<span style = "background-color:#fdd">                Log_Token(sessionCookie).c_str(), totalWaited);</span>
+   }
+
+<span style = "background-color:#fdd">   return retval;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::DoGetWorkerDataEndpoint --
+ *
+ *    Ask the worker for the IP+Port where it is listening for HTTP.
+ *
+ * Results:
+ *    true (with IP and Port filled in) if the worker is listening, otherwise
+ *    false (with IP and Port untouched).
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::DoGetWorkerDataEndpoint(const DWORD sessionId, // IN
+                                        std::string &amp;ip,       // OUT
+                                        std::string &amp;port)     // OUT
+<span style = "background-color:#fdd">{
+   std::string cmd = pipelib::ABIPC_GET_WORKER_CONTACT;</span>
+
+<span style = "background-color:#fdd">   std::string response;</span>
+   if (!mWorkerSessionMgr-&gt;SendMessageToWorker(cmd, sessionId,
+<span style = "background-color:#fdd">                                               false, response)) {</span>
+      LOG_ERROR(mLog, "Failed sending command:%s for SessionID:%lu to worker.",
+<span style = "background-color:#fdd">                pipelib::GetCommandString(cmd), sessionId);
+      return false;
+   } else if (response.empty()) {</span>
+      LOG_ERROR(mLog, "Succeeded sending command:%s for SessionID:%lu to "
+                "worker, but response was empty.",
+<span style = "background-color:#fdd">                pipelib::GetCommandString(cmd), sessionId);
+      return false;</span>
+   }
+
+   //LOG_INFO(mLog, "End: success, response %s", response.c_str());
+
+   /*
+    * The response string is in the form &lt;IP&gt;:&lt;PORT&gt;, so partition it at the colon
+    * to obtain separate IP and PORT outputs.  Pick the rightmost colon so that we
+    * have a chance of working with IPv6 addresses.
+    */
+
+<span style = "background-color:#fdd">   size_t colonPos = response.rfind(':');
+   if (std::string::npos == colonPos) {</span>
+      LOG_ERROR(mLog, "No colon present in GET_WORKER_CONTACT response '%s'",
+<span style = "background-color:#fdd">                response.c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   ip   = response.substr(0, colonPos);
+   port = response.substr(1+colonPos, std::string::npos);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::DoStartSession --
+ *
+ *    Tell the worker that the authentication is done, and the VNCSession
+ *    and encoder need to be started.
+ *
+ * Results:
+ *    true if session could be started, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrl::DoStartSession(const std::string&amp; sessionToken,   // IN
+                               const std::string&amp; subProtocol)    // IN
+<span style = "background-color:#fdd">{
+   std::string vAuth = mClientFacingWebSocket-&gt;GetVAuth();
+   DWORD wtsSessionId = mWorkerSessionMgr-&gt;GetWTSSessionId(vAuth);
+   if (wtsSessionId == INVALID_TS_SESSION_ID) {</span>
+      LOG_ERROR(mLog, "Unable to retrieve WTSSessionID for SessionToken %s.",
+<span style = "background-color:#fdd">                Log_Token(sessionToken).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::string startSessionCmd = pipelib::ABIPC_START_SESSION;
+   std::string cmd = startSessionCmd;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += sessionToken;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += subProtocol;</span>
+
+<span style = "background-color:#fdd">   std::string response;</span>
+   if (!mWorkerSessionMgr-&gt;SendMessageToWorker(cmd, wtsSessionId,
+<span style = "background-color:#fdd">                                               false, response)) {</span>
+      LOG_ERROR(mLog, "Failed sending command:%s for SessionToken:%s to "
+                "worker.", pipelib::GetCommandString(startSessionCmd),
+<span style = "background-color:#fdd">                Log_Token(sessionToken).c_str());
+      return false;
+   } else if (response.empty()) {</span>
+      LOG_ERROR(mLog, "Succeeded sending command:%s for SessionToken:%s to "
+                "worker, but response was empty.",
+                pipelib::GetCommandString(startSessionCmd),
+<span style = "background-color:#fdd">                Log_Token(sessionToken).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::CloseClientFacingWebSocket --
+ *
+ *    Close and reset the client facing websocket.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+ConnectionCtrl::CloseClientFacingWebSocket()
+<span style = "background-color:#fdd">{
+   if (!mClientFacingWebSocket) {
+      LOG_INFO(mLog, "Client facing websocket already closed, nothing to do");
+      return;</span>
+   }
+   LOG_INFO(mLog, "Close and reset Client facing websocket %p",
+<span style = "background-color:#fdd">            mClientFacingWebSocket.get());
+   mClientFacingWebSocket-&gt;Close();
+   mClientFacingWebSocket.reset();
+   LOG_INFO(mLog, "Client facing websocket closed and reset");
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrl::CloseLoopbackWebSocket --
+ *
+ *    Close and reset the loopback websocket.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+ConnectionCtrl::CloseLoopbackWebSocket()
+<span style = "background-color:#fdd">{
+   if (!mLoopbackWebSocket) {
+      LOG_INFO(mLog, "Loopback websocket already closed, nothing to do");
+      return;</span>
+   }
+   LOG_INFO(mLog, "Close and reset loopback websocket %p",
+<span style = "background-color:#fdd">            mLoopbackWebSocket.get());
+   mLoopbackWebSocket-&gt;Close();
+   mLoopbackWebSocket.reset();
+   LOG_INFO(mLog, "Loopback websocket closed and reset");
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * IConnectionCtrl::CreateInstance --
+ *
+ *    Create a new instance of ConnectionCtrl.
+ *
+ * Results:
+ *    Interface pointer.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+IConnectionCtrl*
+IConnectionCtrl::CreateInstance()
+<span style = "background-color:#fdd">{
+   return ConnectionCtrl::Create();
+}</span></pre>
+	</body>
+</html>

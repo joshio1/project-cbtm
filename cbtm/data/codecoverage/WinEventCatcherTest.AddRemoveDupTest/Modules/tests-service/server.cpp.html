@@ -1,0 +1,443 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>server.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2013-2016 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * Server.cpp --
+ *
+ *    HTTP server implementation built on Boost.Asio.
+ */
+
+// appblastlibs
+#include "vm_basic_types.h"
+
+// appblast/common
+#include "appBlastUtil.h"
+#include "PersistentConfig.h"
+
+// appblast/service
+#include "http2/Server.h"
+#include "MainAppService.h"
+
+
+namespace http2 {
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Server::Server
+ *
+ *    Server constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+Server::Server(IRequestDispatcher* dispatcher,
+               IAuthenticateMgr* pAuthenticateMgr)
+   : mLog(log4cxx::Logger::getLogger("http2")),
+     mNumThreads(0),
+     mThread(NULL),
+     mIsUDPInitialized(false),
+     mFakeIOWork(mIOService),
+     mUdpSocket(NULL),
+     mDispatcher(dispatcher),
+     mAuthenticateMgr(pAuthenticateMgr),
+     mNoSsl(false),
+     mAbCertManager(NULL),
+     mUdpEnabled(false),
+     mUdpIpAddr(""),
+     mUdpPort(0)
+<span style = "background-color:#fdd">{
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Server::~Server
+ *
+ *    Server destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+Server::~Server()
+<span style = "background-color:#fdd">{
+   for (size_t i = 0; i &lt; mAcceptors.size(); ++i) {
+      delete mAcceptors[i];</span>
+   }
+
+   // Not owned by server so just set to NULL
+<span style = "background-color:#fdd">   mAuthenticateMgr = NULL;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Server::Listen
+ *
+ *    Begin listening for HTTP requests.
+ *
+ * Results:
+ *    Returns true if bind was successful.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Server::Listen(const std::string &amp;address, int port) // IN
+<span style = "background-color:#fdd">{
+   boost::system::error_code error;
+   boost::asio::ip::tcp::endpoint endpoint;</span>
+   boost::asio::ip::tcp::acceptor *acceptor;
+<span style = "background-color:#fdd">   std::ostringstream endpointStr;</span>
+
+<span style = "background-color:#fdd">   if (!address.empty()) {
+      endpoint = boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string(address), port);
+   } else {
+      endpoint = boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port);</span>
+   }
+
+<span style = "background-color:#fdd">   endpointStr &lt;&lt; endpoint;</span>
+
+   // Check if we are already have an acceptor for this endpoint
+<span style = "background-color:#fdd">   for (size_t i = 0; i &lt; mAcceptors.size(); ++i) {
+      if (endpoint == mAcceptors[i]-&gt;acceptor-&gt;local_endpoint()) {</span>
+         LOG_DEBUG(mLog, "Already listening on endpoint %s",
+<span style = "background-color:#fdd">                   endpointStr.str().c_str());
+         return true;</span>
+      }
+   }
+
+   // Create acceptor
+<span style = "background-color:#fdd">   acceptor = new boost::asio::ip::tcp::acceptor(mIOService);
+   acceptor-&gt;open(endpoint.protocol(), error);</span>
+
+<span style = "background-color:#fdd">   if (error) {</span>
+      LOG_ERROR(mLog, "Error opening HTTP port: %d [%s]",
+<span style = "background-color:#fdd">                error.value(), error.message().c_str());
+      delete acceptor;
+      return false;</span>
+   }
+
+   /*
+    * If address is IPv6, set to v6 only mode
+    * If address is IPv4, initalise the UDP manager if needed
+    */
+<span style = "background-color:#fdd">   if (endpoint.protocol() == boost::asio::ip::tcp::v6()) {
+      acceptor-&gt;set_option(boost::asio::ip::v6_only(true));
+   } else if (!InitializeUDP()) {
+      LOG_ERROR(mLog, "Unable to initialize UDP manager.");</span>
+   }
+
+#ifndef _WIN32
+   /*
+    * Set SO_REUSEADDR option only for non-Windows systems.
+    *
+    * NOTE(for Windows):
+    * 1. SO_REUSEADDR option is not desirable since it allows port stealing
+    * by other processes.
+    * 2. SO_EXCLUSIVEADDRUSE option is not desirable since it doesn't allow
+    * immediate socket reuse due to its dependency on closure of all
+    * the accepted sockets by the underlying transport.
+    * 3. Default bind behavior allows immediate socket reuse but doesn't
+    * guarantee exclusivity. Exclusivity of port usage needs to
+    * be co-ordinated by port reservation done during install.
+    */
+   acceptor-&gt;set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+#endif
+
+<span style = "background-color:#fdd">   acceptor-&gt;set_option(boost::asio::ip::tcp::no_delay(true));
+   acceptor-&gt;bind(endpoint, error);</span>
+
+<span style = "background-color:#fdd">   if (error) {</span>
+      LOG_ERROR(mLog, "Error binding HTTP port to '%s': %d [%s]",
+<span style = "background-color:#fdd">                endpointStr.str().c_str(), error.value(), error.message().c_str());
+      delete acceptor;
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   acceptor-&gt;listen(boost::asio::socket_base::max_connections, error);</span>
+
+<span style = "background-color:#fdd">   if (error) {</span>
+      LOG_ERROR(mLog, "Error listening on HTTP port: %d [%s]",
+<span style = "background-color:#fdd">                error.value(), error.message().c_str());
+      delete acceptor;
+      return false;</span>
+   }
+
+   LOG_DEBUG(mLog, "Listening for connections on '%s'",
+<span style = "background-color:#fdd">             endpointStr.str().c_str());</span>
+
+
+   // Add to active acceptor list
+<span style = "background-color:#fdd">   ActiveAcceptor *active = new ActiveAcceptor();
+   active-&gt;acceptor.reset(acceptor);
+   mAcceptors.push_back(active);
+   AcceptNewConnection(active);
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Server::Start
+ *
+ *    Starts a pool of threads and begins accepting requests.
+ *
+ * Results:
+ *    Returns true if start-up was successful.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+Server::Start(size_t numThreads) // IN
+<span style = "background-color:#fdd">{
+   PersistentConfig* config = MainAppService::Get()-&gt;GetConfig();</span>
+#ifdef DEVELOPER_FRIENDLY
+   config-&gt;GetBool(CONFIG_DISABLE_SSL, mNoSsl);
+#endif
+
+<span style = "background-color:#fdd">   mAbCertManager = new AbCertManager(config, mIOService);
+   if (mAbCertManager == NULL) {
+      LOG_ERROR(mLog, "Unable to instantiate AbCertManager.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   if (!mNoSsl &amp;&amp; !mAbCertManager-&gt;InitializeSslContext()) {
+      LOG_ERROR(mLog, "Unable to initialize SSL context.");
+      delete mAbCertManager;
+      mAbCertManager = NULL;
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   mNumThreads = numThreads;
+   mThread = new boost::thread(boost::bind(&amp;http2::Server::Run, this));
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Server::Run
+ *
+ *    Main HTTP server loop.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Server::Run() // IN
+<span style = "background-color:#fdd">{
+   LOG_DEBUG(mLog, "Start Http server.");</span>
+
+   // Create a pool of threads to run all of the io_services.
+<span style = "background-color:#fdd">   std::vector&lt;boost::shared_ptr&lt;boost::thread&gt; &gt; threads;
+   for (std::size_t i = 0; i &lt; mNumThreads; ++i) {</span>
+      boost::shared_ptr&lt;boost::thread&gt;
+        thread(new boost::thread(boost::bind(&amp;boost::asio::io_service::run,
+<span style = "background-color:#fdd">                                             &amp;mIOService)));
+      threads.push_back(thread);
+   }</span>
+
+   // Wait for all threads in the pool to exit.
+<span style = "background-color:#fdd">   for (std::size_t i = 0; i &lt; threads.size(); ++i) {
+      threads[i]-&gt;join();</span>
+   }
+
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "HTTP Server exit.");
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Server::Shutdown
+ *
+ *    Stop handling HTTP requests.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Server::Shutdown()
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();</span>
+
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "Shutting down requested");
+   mIOService.stop();</span>
+   LOG_DEBUG(mLog, "IO Service is stopped (%I64d ms)",
+<span style = "background-color:#fdd">             AbUtil::GetClock64() - startTime);</span>
+
+<span style = "background-color:#fdd">   if (mThread) {
+      mThread-&gt;join();
+      delete mThread;
+      mThread = NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   if (mUdpSocket) {
+      delete mUdpSocket;
+      mUdpSocket = NULL;</span>
+   }
+
+<span style = "background-color:#fdd">   mIsUDPInitialized = false;</span>
+
+   // Destroy the Certificate Manager
+<span style = "background-color:#fdd">   delete mAbCertManager;
+   mAbCertManager = NULL;</span>
+
+   LOG_DEBUG(mLog, "Threads are down (%I64d ms)",
+<span style = "background-color:#fdd">             AbUtil::GetClock64() - startTime);
+}</span>
+
+
+/*
+*-----------------------------------------------------------------------------
+*
+* http2::Server::AcceptNewConnection
+*
+*    Starts a new async_accept on a acceptor.
+*
+* Results:
+*    Returns true if bind was successful.
+*
+*-----------------------------------------------------------------------------
+*/
+
+void
+Server::AcceptNewConnection(Server::ActiveAcceptor *acceptor)
+<span style = "background-color:#fdd">{</span>
+   acceptor-&gt;connection.reset(new Connection(mIOService, mAbCertManager-&gt;GetSslContext(),
+                                             mDispatcher, mAuthenticateMgr, !mNoSsl,
+                                             mUdpEnabled, mUdpIpAddr,
+<span style = "background-color:#fdd">                                             mUdpPort));</span>
+
+   acceptor-&gt;acceptor-&gt;async_accept(acceptor-&gt;connection-&gt;GetSocket(),
+                                    boost::bind(&amp;Server::OnAccept,
+                                                this,
+                                                boost::asio::placeholders::error,
+<span style = "background-color:#fdd">                                                acceptor));
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::Server::OnAccept
+ *
+ *    Callback on a newly accepted connection.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+Server::OnAccept(const boost::system::error_code &amp;e,  // IN
+                 Server::ActiveAcceptor *acceptor)    // IN
+<span style = "background-color:#fdd">{
+   if (!e)</span>
+   {
+<span style = "background-color:#fdd">      acceptor-&gt;connection-&gt;Start();
+      AcceptNewConnection(acceptor);</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+*-----------------------------------------------------------------------------
+*
+* http2::Server::InitializeUDP
+*
+*    Called to initialize the UDP manager.
+*
+* Results:
+*    Returns true if successful.
+*
+*-----------------------------------------------------------------------------
+*/
+
+bool
+Server::InitializeUDP()
+<span style = "background-color:#fdd">{
+   PersistentConfig* config = MainAppService::Get()-&gt;GetConfig();
+
+   if (AbUtil::GetFipsModeRegistry()) {
+      LOG_INFO(mLog, "FIPS mode is requested, UDP support is disabled.");
+      mUdpEnabled = false;
+      return true;</span>
+   }
+
+<span style = "background-color:#fdd">   if (mIsUDPInitialized) {
+      return true;</span>
+   }
+
+<span style = "background-color:#fdd">   bool enabled = MainAppService::Get()-&gt;IsUdpConfigEnabled();
+   LOG_INFO(mLog, "UDP support is %s", enabled ? "enabled" : "disabled");</span>
+
+<span style = "background-color:#fdd">   mUdpEnabled = false;</span>
+
+<span style = "background-color:#fdd">   if (enabled) {
+      if (!AbUtil::GetServerIP(mUdpIpAddr)) {
+         LOG_ERROR(mLog, "Could not get the UDP IP address");
+         return false;</span>
+      }
+
+<span style = "background-color:#fdd">      mUdpPort = CONFIG_PORTSECURE_DEFAULT;</span>
+      config-&gt;GetInt(CONFIG_PORT_SECURE, mUdpPort,
+<span style = "background-color:#fdd">                     CONFIG_PORTSECURE_MIN, CONFIG_PORTSECURE_MAX);
+      LOG_DEBUG(mLog, "UDP IP = %s PORT = %i", mUdpIpAddr.c_str(), mUdpPort);</span>
+
+<span style = "background-color:#fdd">      mUdpEnabled = true;</span>
+
+      // If filter driver is used, bind to UDP port
+<span style = "background-color:#fdd">      if (MainAppService::Get()-&gt;UseFilterDriver()) {
+         LOG_DEBUG(mLog, "Try to bind to UDP port %d", mUdpPort);</span>
+         try {
+            mUdpSocket = new boost::asio::ip::udp::socket(mIOService,
+               boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(),
+<span style = "background-color:#fdd">                                              mUdpPort));
+            LOG_DEBUG(mLog, "Finished UDP port bind");
+         } catch (std::exception &amp;e) {
+            LOG_ERROR(mLog, "Could not do the UDP bind, error: %s.", e.what());
+         }</span>
+      }
+<span style = "background-color:#fdd">      mIsUDPInitialized = true;</span>
+   }
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+} // namespace http2</pre>
+	</body>
+</html>

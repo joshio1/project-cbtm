@@ -1,0 +1,1745 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>websocket.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2013-2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * WebSocket.cpp --
+ *
+ *    An HTML5 WebSocket object.
+ */
+
+// appblast/common
+#include "appBlastUtil.h"
+#include "HybiStatusCode.h"
+#include "PersistentConfig.h"
+
+// appblast/service
+#include "http2/WebSocket.h"
+#include "include/IConnectionCtrl.h"
+#include "include/IWorkerSessionMgr.h"
+#include "MainAppService.h"
+
+using std::vector;
+
+namespace http2 {
+
+<span style = "background-color:#dfd">WebSocket::ErrorCategory WebSocket::mErrorCategory;
+boost::mutex WebSocket::mLock;</span>
+
+// Maximum size of receive buffer used for async reads from the websocket
+static const std::size_t MAX_RECV_BUF_SIZE = 32768;
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::ErrorCategory::message
+ *
+ *    Override boost::system::error_category::message()
+ *    See boost::system::error_category::message()
+ *
+ * Results:
+ *    message string.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+WebSocket::ErrorCategory::message(int ev) const
+<span style = "background-color:#fdd">{
+   switch (ev) {</span>
+   case hybi::HYBI_CLOSE_STATUS_NORMAL:
+<span style = "background-color:#fdd">      return "Normal close message received from peer";</span>
+   case hybi::HYBI_CLOSE_STATUS_GOING_AWAY:
+<span style = "background-color:#fdd">      return "Going away message received from peer";</span>
+   case hybi::HYBI_CLOSE_STATUS_PROTOCOL_ERROR:
+<span style = "background-color:#fdd">      return "Protocol error";</span>
+   case hybi::HYBI_CLOSE_STATUS_INVALID_DATA:
+<span style = "background-color:#fdd">      return "Unacceptable data";</span>
+   case hybi::HYBI_CLOSE_STATUS_EMPTY:
+<span style = "background-color:#fdd">      return "No status code present";</span>
+   case hybi::HYBI_CLOSE_STATUS_ABNORMAL:
+<span style = "background-color:#fdd">      return "Connection closed abnormally";</span>
+   case hybi::HYBI_CLOSE_STATUS_INCONSISTENT_DATA:
+<span style = "background-color:#fdd">      return "Data not consistent with message type";</span>
+   case hybi::HYBI_CLOSE_STATUS_POLICY_VIOLATION:
+<span style = "background-color:#fdd">      return "Message violated policy";</span>
+   case hybi::HYBI_CLOSE_STATUS_MESSAGE_TOO_BIG:
+<span style = "background-color:#fdd">      return "Message too big";</span>
+   case hybi::HYBI_CLOSE_STATUS_UNSUPPORTED_EXTENSIONS:
+<span style = "background-color:#fdd">      return "Unsupported extensions";</span>
+   case hybi::HYBI_CLOSE_STATUS_TLS_HANDSHAKE_ERROR:
+<span style = "background-color:#fdd">      return "TLS Handshake Error";</span>
+   default:
+<span style = "background-color:#fdd">      return "Unknown error";</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::WebSocket
+ *
+ *    Constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WebSocket::WebSocket(const std::string&amp; url,             // IN
+                     const std::string&amp; cookie,          // IN
+                     const ISubprotocol&amp; subproto,       // IN
+                     Connection_ptr c,                   // IN
+                     boost::asio::io_service&amp; ioService, // IN
+                     bool ssl)                           // IN
+  : mLog(log4cxx::Logger::getLogger("http2")),
+    mUrl(url),
+    mCookie(cookie),
+    mSubprotocol(subproto),
+    mConnection(c),
+    mReadCallback(NULL),
+    mUserBytesReadSinceCallback(0),
+    mTriggerOnPartialRead(false),
+    mDecoder(subproto),
+    mIsClosing(false),
+    mPeerInitiatedClose(false),
+    mPeerCloseStatus(hybi::HYBI_CLOSE_STATUS_EMPTY),
+    mIsClosed(false),
+    mCloseOnWrite(false),
+    mReadInProgress(false),
+    mStrand(ioService),
+    mIsSsl(ssl),
+    mIsClientFacing(false),
+    mRecvBuf(NULL),
+    mRecvBufSize(MAX_RECV_BUF_SIZE),
+    mBytesRead(0),
+    mClientConnectedToWorker(false)
+<span style = "background-color:#fdd">{
+   PersistentConfig *config = MainAppService::Get()-&gt;GetConfig();
+   config-&gt;GetInt(CONFIG_HTTP2_MAX_EMPTY_READS, mMaxEmptyReads);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::~WebSocket
+ *
+ *    Destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+WebSocket::~WebSocket()
+<span style = "background-color:#fdd">{
+   ASSERT(mWriteQ.empty());</span>
+
+   // Start graceful TCP shutdown.
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "WebSocket %p.", this);
+   boost::system::error_code ignored_ec;</span>
+   mConnection-&gt;GetSocket().shutdown(boost::asio::ip::tcp::socket::shutdown_both,
+<span style = "background-color:#fdd">                                     ignored_ec);</span>
+   LOG_INFO(mLog, "WebSocket %p: Socket shutdown completed. "
+<span style = "background-color:#fdd">            "Starting connection close.", this);
+   mConnection-&gt;Close();</span>
+
+<span style = "background-color:#fdd">   ReleaseRecvBuffer();</span>
+
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "WebSocket %p: Destroyed.", this);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::Send
+ *
+ *    Called to write bytes to the other end of the WebSocket.
+ *
+ * Results:
+ *    Returns true if the write was queued.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::Send(const char* buf, std::size_t len, WebSocketWriteCb cb)
+<span style = "background-color:#fdd">{</span>
+   // The lock is held by the caller.
+
+   //LOG_ERROR(mLog, "WebSocket::Send() this %p buf %p len %u", this, buf, len);
+
+<span style = "background-color:#fdd">   if (mIsClosing || mCloseOnWrite) {</span>
+      LOG_ERROR(mLog, "WebSocket %p: Sending data failed due to websocket "
+                "isClosing:%s or closeOnWrite:%s.",
+                this, mIsClosing ? "True" : "False",
+<span style = "background-color:#fdd">                mCloseOnWrite ? "True" : "False");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   bool queueWasEmpty = mWriteQ.empty();
+   mWriteQ.push_back(WriteData());
+   WriteData&amp; wd = mWriteQ.back();</span>
+
+<span style = "background-color:#fdd">   wd.userBuf = buf;
+   wd.userBufLen = len;
+   wd.encodedBuf = hybi::Encoder::Encode(buf, len, mSubprotocol);
+   wd.cb = cb;
+   wd.inProgress = false;</span>
+
+<span style = "background-color:#fdd">   if (!queueWasEmpty) {</span>
+      // A write is in progress.
+<span style = "background-color:#fdd">      return true;</span>
+   }
+
+<span style = "background-color:#fdd">   wd.inProgress = true;</span>
+
+   /*
+    * Perform the write via the strand context.
+    * See the comment in WebSocket.h for more details.
+    *
+    * The dynamic_pointer_cast&lt;&gt; is used because the shared pointer object
+    * (shared_from_this()) is the IWebSocket object and the object instance
+    * context (WebSocket) is needed - hence the dynamic cast. This applies
+    * throughout the code.
+    */
+   mStrand.post(boost::bind(&amp;WebSocket::DoWrite,
+                boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+<span style = "background-color:#fdd">                wd.encodedBuf));</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::DoWrite
+ *
+ *    Called to actually perform the write operation in the strand context.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::DoWrite(vector&lt;char&gt;* buffer)
+<span style = "background-color:#fdd">{</span>
+   //LOG_ERROR(mLog, "WebSocket::DoWrite() this %p buf %p", this, buffer);
+
+<span style = "background-color:#fdd">   if (mIsSsl) {
+      SSLSocket&amp; socket = mConnection-&gt;GetSSLSocket();</span>
+      boost::asio::async_write(socket,
+         boost::asio::buffer(*buffer),
+         mStrand.wrap(boost::bind(&amp;WebSocket::OnWrite,
+            boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+            boost::asio::placeholders::error,
+<span style = "background-color:#fdd">            boost::asio::placeholders::bytes_transferred)));
+   } else {
+      TCPSocket&amp; socket = mConnection-&gt;GetTCPSocket();</span>
+      boost::asio::async_write(socket,
+         boost::asio::buffer(*buffer),
+         mStrand.wrap(boost::bind(&amp;WebSocket::OnWrite,
+            boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+            boost::asio::placeholders::error,
+<span style = "background-color:#fdd">            boost::asio::placeholders::bytes_transferred)));</span>
+   }
+   //LOG_ERROR(mLog, "WebSocket::DoWrite() done");
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::OnWrite
+ *
+ *    Callback called after a complete write.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::OnWrite(const boost::system::error_code&amp; e, std::size_t bytesWritten)
+<span style = "background-color:#fdd">{</span>
+   //LOG_ERROR(mLog, "WebSocket::OnWrite() called, this %p", this);
+
+<span style = "background-color:#fdd">   boost::mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   ASSERT(!mWriteQ.empty());</span>
+
+<span style = "background-color:#fdd">   WriteData&amp; wd = mWriteQ.front();
+   const char* userBuf = wd.userBuf;
+   std::size_t userBufLen = wd.userBufLen;
+   WebSocketWriteCb cb = wd.cb;
+   delete wd.encodedBuf;
+   mWriteQ.pop_front();</span>
+
+<span style = "background-color:#fdd">   if (e) {</span>
+      // Don't attempt a close handshake for write errors.
+      LOG_WARN(mLog, "WebSocket %p: Error writing, code:%d [%s: %s]."
+               "Continue finishing websocket close.",
+<span style = "background-color:#fdd">               this, e.value(), e.category().name(), e.message().c_str());
+      mIsClosing = true;
+      cb(e, 0, userBuf);
+      FinishClose(e, false);
+      return;
+   } else if (mCloseOnWrite) {</span>
+      // Handle any close previously requested of us.
+      LOG_INFO(mLog, "WebSocket %p: Calling close due to CloseOnWrite.",
+<span style = "background-color:#fdd">               this);
+      Close();</span>
+   }
+
+<span style = "background-color:#fdd">   cb(e, userBufLen, userBuf);</span>
+
+<span style = "background-color:#fdd">   if (!mWriteQ.empty() &amp;&amp; !mIsClosing &amp;&amp; !mCloseOnWrite) {
+      WriteData&amp; next = mWriteQ.front();
+      next.inProgress = true;</span>
+      /*
+       * We're in the strand context via the handler --
+       * No need to wrap async_write with a post through the strand.
+       */
+<span style = "background-color:#fdd">      DoWrite(next.encodedBuf);</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::RecvPartial
+ *
+ *    Called to receive data from a WebSocket.
+ *    The callback is called when any bytes have been decoded.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::RecvPartial(char* buf, std::size_t len, WebSocketReadCb cb)
+<span style = "background-color:#fdd">{</span>
+   // The lock is held by the caller.
+
+<span style = "background-color:#fdd">   if (mIsClosing || mReadInProgress) {</span>
+      LOG_DEBUG(mLog, "WebSocket %p: Skipping due to isClosing:%s or "
+                "readInProgress:%s.", this, mIsClosing ? "True" : "False",
+<span style = "background-color:#fdd">                mReadInProgress ? "True" : "False");
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   mTriggerOnPartialRead = true;
+   mReadCallback = cb;</span>
+
+   // Always try to decode without reading first in case we have data buffered.
+<span style = "background-color:#fdd">   mDecoder.SetUserBuffer(buf, len);
+   DecodeMore(0, false);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::DecodeMore
+ *
+ *    Called to decode more WebSocket data.
+ *    It may result in a read if the decoder's buffer is empty.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::DecodeMore(std::size_t bytesRead, bool viaHandler)
+<span style = "background-color:#fdd">{
+   bool decodingError = false;
+   short closeStatus = 0;</span>
+
+   size_t userBytesRead =
+<span style = "background-color:#fdd">      mDecoder.Decode(bytesRead, decodingError, closeStatus);</span>
+
+<span style = "background-color:#fdd">   mUserBytesReadSinceCallback += userBytesRead;</span>
+
+<span style = "background-color:#fdd">   if (closeStatus) {</span>
+      LOG_INFO(mLog, "WebSocket %p: CloseStatus:%hd, closing:%s.", this,
+<span style = "background-color:#fdd">               closeStatus, mIsClosing ? "True" : "False");
+      if (decodingError) {</span>
+         LOG_WARN(mLog, "WebSocket %p: Decoding error while closing in "
+<span style = "background-color:#fdd">                  "progress.", this);</span>
+      }
+<span style = "background-color:#fdd">      if (mIsClosing) {
+         ASSERT(!mPeerInitiatedClose);</span>
+         /*
+          * This means we got the acknowledgement to the close we initiated.
+          * Now we can finish closing.
+          */
+         LOG_INFO(mLog, "WebSocket %p: Previously initiated close process, "
+                  "received acknowledgement from client, "
+<span style = "background-color:#fdd">                  "continue finishing the close process.", this);</span>
+         boost::system::error_code err(hybi::HYBI_CLOSE_STATUS_NORMAL,
+<span style = "background-color:#fdd">                                       mErrorCategory);
+         FinishClose(err, true);
+         return;</span>
+      }
+
+      /*
+       * The peer is expecting us to acknowledge their close --
+       * let's do that then.
+       */
+      LOG_INFO(mLog, "WebSocket %p: Peer initiated close process, "
+<span style = "background-color:#fdd">               "peer expecting acknowledgement, sending acknowledgement.", this);
+      mPeerInitiatedClose = true;
+      mPeerCloseStatus = closeStatus;</span>
+
+      LOG_INFO(mLog, "WebSocket %p: Calling close due CloseStatus:%hd.", this,
+<span style = "background-color:#fdd">               closeStatus);
+      Close();
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   if (decodingError) {
+      if (mReadCallback) {</span>
+         boost::system::error_code err(hybi::HYBI_CLOSE_STATUS_PROTOCOL_ERROR,
+<span style = "background-color:#fdd">                                       mErrorCategory);
+         mReadCallback(err, mUserBytesReadSinceCallback);
+      } else {
+         LOG_WARN(mLog, "WebSocket %p: ReadCallback is NULL.", this);</span>
+      }
+<span style = "background-color:#fdd">      return;</span>
+   }
+
+   /*
+    * We should continue read data from socket until we read a close frame
+    * or encounter a read error even if we are closing. For sometimes, there are
+    * a lot of datas still on the socket and we can't decode it within current
+    * user buffer. And if we don't reset user buffer, it will lead decoder read
+    * buffer to full. For details information, please see PR 1657143.
+    */
+   if ((mTriggerOnPartialRead &amp;&amp; userBytesRead &gt; 0) ||
+<span style = "background-color:#fdd">       (mUserBytesReadSinceCallback == mDecoder.GetUserBufferSize())) {
+      mUserBytesReadSinceCallback = 0;</span>
+      // We decoded enough to satisfy the user.
+<span style = "background-color:#fdd">      if (mReadCallback) {</span>
+         boost::system::error_code success =
+<span style = "background-color:#fdd">            boost::system::errc::make_error_code(boost::system::errc::success);</span>
+         mReadCallback(success,
+                       mTriggerOnPartialRead ?
+<span style = "background-color:#fdd">                       userBytesRead : mDecoder.GetUserBufferSize());
+      } else {
+         LOG_WARN(mLog, "WebSocket %p: ReadCallback is NULL.", this);
+      }
+   } else if (mDecoder.NeedsBytes()) {</span>
+      // Read more.
+<span style = "background-color:#fdd">      mReadInProgress = true;
+      if (viaHandler) {</span>
+         /*
+          * We're in the strand context via the handler --
+          * No need to wrap async_read_some with a post through the strand.
+          */
+<span style = "background-color:#fdd">         DoRead();
+      } else {</span>
+         /*
+          * Perform the read via the strand context.
+          * See the comment in WebSocket.h for more details.
+          */
+         mStrand.post(boost::bind(&amp;WebSocket::DoRead,
+<span style = "background-color:#fdd">            boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this())));</span>
+      }
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::DoRead
+ *
+ *    Called to actually perform the read operation in the strand context.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::DoRead()
+<span style = "background-color:#fdd">{
+   if (mIsSsl) {
+      SSLSocket&amp; socket = mConnection-&gt;GetSSLSocket();</span>
+      socket.async_read_some(boost::asio::buffer(mDecoder.GetReadBuffer()),
+         mStrand.wrap(boost::bind(&amp;WebSocket::OnRead,
+            boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+            boost::asio::placeholders::error,
+<span style = "background-color:#fdd">            boost::asio::placeholders::bytes_transferred)));
+   } else {
+      TCPSocket&amp; socket = mConnection-&gt;GetTCPSocket();</span>
+      socket.async_read_some(boost::asio::buffer(mDecoder.GetReadBuffer()),
+         mStrand.wrap(boost::bind(&amp;WebSocket::OnRead,
+            boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+            boost::asio::placeholders::error,
+<span style = "background-color:#fdd">            boost::asio::placeholders::bytes_transferred)));</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::OnRead
+ *
+ *    Callback called after reading some bytes.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::OnRead(const boost::system::error_code&amp; e, // IN
+                  std::size_t bytesRead)              // IN
+<span style = "background-color:#fdd">{
+   boost::mutex::scoped_lock guard(mLock);
+   bool doClose = false;</span>
+
+<span style = "background-color:#fdd">   mReadInProgress = false;</span>
+
+<span style = "background-color:#fdd">   if (mIsClosed) {
+      LOG_DEBUG(mLog, "WebSocket %p: Closed status, nothing to do.", this);
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   if (e) {</span>
+      bool bIsSSLShortRead =
+         (e.category() == boost::asio::error::get_ssl_category() &amp;&amp;
+<span style = "background-color:#fdd">          e.value() == ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SHORT_READ));</span>
+
+<span style = "background-color:#fdd">      if (bIsSSLShortRead) {</span>
+         /*
+          * SSL library encountered EOF while reading or without SSL shutdown
+          * handshake.  This is not a fatal error, and we should not close
+          * the websocket until all bytesRead are processed.
+          */
+         LOG_WARN(mLog, "Websocket %p: SSL short read seen, bytesRead=%u\n",
+<span style = "background-color:#fdd">                  this, bytesRead);
+      } else {</span>
+         LOG_WARN(mLog, "WebSocket %p: Error reading, code:%d [%s: %s]. "
+                  "Finishing websocket close. %d bytes read.",
+                  this, e.value(), e.category().name(), e.message().c_str(),
+<span style = "background-color:#fdd">                  bytesRead);
+         doClose = true;</span>
+      }
+   }
+
+   /*
+    * TODO: IsRepeatedEmptyRead() can probably be replaced with !bytesRead, as
+    * an empty read should indicate no more data.  But this needs more testing.
+    */
+<span style = "background-color:#fdd">   if (IsRepeatedEmptyRead(bytesRead)) {
+      LOG_INFO(mLog, "Websocket %p: No more data left to read, closing\n");</span>
+      doClose = true;
+   }
+
+<span style = "background-color:#fdd">   if (doClose) {
+      mIsClosing = true;
+      FinishClose(e, true);
+      return;</span>
+   }
+
+   // Try decoding the new bytes.
+<span style = "background-color:#fdd">   DecodeMore(bytesRead, true);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::Close
+ *
+ *    Called to either initiate the close handshake or acknowledge the
+ *    receipt of the initial close frame from the peer.
+ *
+ *    For more details on the close handshake:
+ *    http://tools.ietf.org/html/rfc6455#section-1.4
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::Close()
+<span style = "background-color:#fdd">{</span>
+   /*
+    * The lock is held by the caller in the worker's version of
+    * WebSocket::Close().
+    * For the service, the websocket is closed from the Connection object
+    * in a boost callback thread, so there is no lock acquired by the caller.
+    * TODO: Using the lock below seems to cause problems, we don't get
+    * websocket error notifications anymore, so perhaps this lock is
+    * interfering with some other code flow?
+    */
+   //boost::mutex::scoped_lock guard(mLock);
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "WebSocket %p", this);</span>
+
+<span style = "background-color:#fdd">   if (mIsClosing) {
+      LOG_INFO(mLog, "WebSocket %p is already closing, nothing to do.", this);
+      return;</span>
+   }
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "WebSocket %p is closing.", this);</span>
+
+<span style = "background-color:#fdd">   if (!mWriteQ.empty() &amp;&amp; mWriteQ.front().inProgress) {</span>
+      /*
+       * Don't clobber this write in progress.
+       * The write callback will call this again.
+       */
+      LOG_INFO(mLog, "WebSocket %p: Writing is in progress. Will retry "
+<span style = "background-color:#fdd">               "sending close frame after current writing completed.", this);
+      mCloseOnWrite = true;
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   mIsClosing = true;</span>
+
+   /*
+    * Perform the close frame write via the strand context.
+    * See the comment in WebSocket.h for more details.
+    */
+   mStrand.post(boost::bind(&amp;WebSocket::DoClose,
+<span style = "background-color:#fdd">                boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this())));
+}</span>
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * WebSocket::NotifyReadDataReady --
+ *
+ *    Callback from the WebSocket once the read is complete. When the
+ *    data is ready, we find the redirect end. There are 2 websockets
+ *    we are dealing with: 1. the websocket that talks to the external
+ *    client and 2. the internal loopback websocket that talks to the worker
+ *    Each one has the other as a redirect end. So once we find the other
+ *    websocket via a lookup, we can Send() the data there and then wait for
+ *    the next data chunk on the current websocket.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::NotifyReadDataReady(const boost::system::error_code&amp; e,   // IN
+                               std::size_t bytesRead)                // IN
+<span style = "background-color:#fdd">{</span>
+   /*
+    * TODO: Does the lock need to be acquired here? Note that this callback
+    * is called from DecodeMore() and\or FinishClose(), so if a lock is
+    * to be added, make sure we are not acquiring the (non recursive) lock
+    * from those functions already.
+    */
+   bool bError = false;
+<span style = "background-color:#fdd">   if (e) {</span>
+      LOG_WARN(mLog, "WebSocket %p: Error reading, code: %d [%s: %s].",
+<span style = "background-color:#fdd">               this, e.value(), e.category().name(), e.message().c_str());</span>
+      bError = true;
+   }
+
+   if (bError) {
+<span style = "background-color:#fdd">      HandleConnectionError();
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   if (bytesRead &gt; MAX_RECV_BUF_SIZE) {
+      LOG_ERROR(mLog, "WebSocket %p: Too many bytes read.", this);</span>
+   }
+
+<span style = "background-color:#fdd">   if (!mRedirectWebSocket) {
+      LOG_ERROR(mLog, "WebSocket %p: Invalid redirect websocket.", this);
+      return;</span>
+   }
+
+   // Data received, forward it to the other WebSocket.
+   bool sent = mRedirectWebSocket-&gt;SendData(mRecvBuf, bytesRead,
+                   boost::bind(&amp;WebSocket::NotifyBufferSent,
+                               boost::dynamic_pointer_cast&lt;WebSocket&gt;(
+                                  shared_from_this()),
+                               boost::asio::placeholders::error,
+                               boost::asio::placeholders::bytes_transferred,
+<span style = "background-color:#fdd">                               mRecvBuf));
+   if (!sent) {</span>
+      /*
+       * We get into this error if the other socket is either closing
+       * or closeOnWrite (in the middle of writing). See WebSocket::Send.
+       * Logically, this is the same error as boost encountering error when
+       * sending the data. So, handle it the same way as the error handler in
+       * NotifyBufferSent.
+       */
+      LOG_ERROR(mLog, "WebSocket %p: Forwarding (%u bytes of buffer %p) to "
+                "redirect websocket %p failed.",
+<span style = "background-color:#fdd">                this, bytesRead, mRecvBuf, mRedirectWebSocket.get());
+      HandleConnectionError();</span>
+   } else {
+       //LOG_DEBUG(mLog, "Forwarded (%u bytes of buffer %p) from %p to "
+       //          "redirect websocket %p succeeded",
+       //          bytesRead, mRecvBuf, this, mRedirectWebSocket.get());
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * WebSocket::NotifyDataAvailable --
+ *
+ *    This callback is used primarily in the UDP fallback path. It indicates
+ *    that data is available on the websocket. We note the number of bytes
+ *    that have been received, so that the data can subsequently be
+ *    extracted when needed.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::NotifyDataAvailable(const boost::system::error_code&amp; e,   // IN
+                               std::size_t bytesRead)                // IN
+<span style = "background-color:#fdd">{
+   if (e) {</span>
+      LOG_WARN(mLog, "WebSocket %p: Error reading, code: %d [%s: %s].",
+<span style = "background-color:#fdd">               this, e.value(), e.category().name(), e.message().c_str());</span>
+
+<span style = "background-color:#fdd">      if (mClientConnectedToWorker) {</span>
+         /*
+          * If the worker got a connection directly from the client, then we need
+          * to notify it to close down that connection because the primary
+          * websocket saw an error.
+          */
+<span style = "background-color:#fdd">         IWorkerSessionMgr::GetInstance()-&gt;TerminateSession(GetVAuth());</span>
+      }
+
+<span style = "background-color:#fdd">      return;</span>
+   }
+
+   /*
+    * mClientConnectedToWorker will be set if the connection was received from
+    * the client to the worker. In that case the worker notifies the service
+    * to not react to data being received on the primary websocket.
+    */
+<span style = "background-color:#fdd">   if (mClientConnectedToWorker) {
+      LOG_WARN(mLog, "WebSocket %p was marked invalid, do nothing.", this);
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   if (bytesRead &gt; MAX_RECV_BUF_SIZE) {
+      LOG_ERROR(mLog, "WebSocket %p: Too many bytes read.", this);</span>
+   }
+
+   // Save this so that we know how many bytes are valid.
+<span style = "background-color:#fdd">   mBytesRead = bytesRead;</span>
+
+   LOG_DEBUG(mLog, "WebSocket %p: Number of bytes read:%lu.", this,
+<span style = "background-color:#fdd">             (unsigned long) bytesRead);</span>
+
+<span style = "background-color:#fdd">   mConnection-&gt;NotifyDataAvailable(shared_from_this());
+}</span>
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * WebSocket::DummyReadDataReady --
+ *
+ *    Callback when we get data or error for the dummy read.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::DummyReadDataReady(const boost::system::error_code&amp; e,   // IN
+                              std::size_t bytesRead)                // IN
+<span style = "background-color:#fdd">{
+   if (e) {</span>
+      LOG_INFO(mLog, "WebSocket %p: Error reading, code: %d [%s: %s].",
+<span style = "background-color:#fdd">               this, e.value(), e.category().name(), e.message().c_str());
+   } else {
+      LOG_ERROR(mLog, "WebSocket %p: Do not expect to receive data", this);</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * WebSocket::NotifyBufferSent --
+ *
+ *      Notification that the WebSocket finished sending our buffer.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::NotifyBufferSent(const boost::system::error_code&amp; e,   // IN
+                             std::size_t bytesSent,               // IN
+                             char* buf)                           // IN
+<span style = "background-color:#fdd">{</span>
+   bool bError = false;
+<span style = "background-color:#fdd">   if (e) {</span>
+      LOG_WARN(mLog, "WebSocket %p: Error writing, code: %d [%s: %s].",
+<span style = "background-color:#fdd">               this, e.value(), e.category().name(), e.message().c_str());</span>
+      bError = true;
+   }
+
+   if (bError) {
+<span style = "background-color:#fdd">      HandleConnectionError();
+      return;</span>
+   }
+
+   /*
+    * TODO:
+    * If all bytes have not been sent, need to do another send(), otherwise
+    * queue another async read to get more data
+    */
+<span style = "background-color:#fdd">   DoReadData();
+}</span>
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * WebSocket::AllocRecvBuffer --
+ *
+ *      Allocate recv buffer.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::AllocRecvBuffer()
+<span style = "background-color:#fdd">{
+   if (mRecvBuf == NULL) {
+      mRecvBuf = new char[MAX_RECV_BUF_SIZE];
+      if (mRecvBuf == NULL) {</span>
+         LOG_ERROR(mLog, "WebSocket %p: Could not allocate receive buffer.",
+<span style = "background-color:#fdd">                   this);
+         ASSERT(0);</span>
+      }
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * WebSocket::ReleaseRecvBuffer --
+ *
+ *      Release recv buffer.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::ReleaseRecvBuffer()
+{
+   if (mRecvBuf) {
+      delete [] mRecvBuf;
+      mRecvBuf = NULL;
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::DoWrite
+ *
+ *    Called to actually perform the close operation in the strand context.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::DoClose()
+<span style = "background-color:#fdd">{</span>
+   /*
+    * Send a hardcoded "1000" close reason, from the RFC:
+    *
+    * "1000 indicates a normal closure, meaning that the purpose for
+    * which the connection was established has been fulfilled."
+    *
+    * It's all we need to send -- if the peer sees it, it knows the
+    * connection was terminated intentionally so it shouldn't attempt
+    * any automatic reconnection.
+    */
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "WebSocket %p: Sending websocket close frame.", this);
+   if (mIsSsl) {
+      SSLSocket&amp; socket = mConnection-&gt;GetSSLSocket();</span>
+      boost::asio::async_write(socket,
+         boost::asio::buffer(hybi::Encoder::EncodeClose()),
+         mStrand.wrap(boost::bind(&amp;WebSocket::OnClose,
+            boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+            boost::asio::placeholders::error,
+<span style = "background-color:#fdd">            boost::asio::placeholders::bytes_transferred)));
+   } else {
+      TCPSocket&amp; socket = mConnection-&gt;GetTCPSocket();</span>
+      boost::asio::async_write(socket,
+         boost::asio::buffer(hybi::Encoder::EncodeClose()),
+         mStrand.wrap(boost::bind(&amp;WebSocket::OnClose,
+            boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+            boost::asio::placeholders::error,
+<span style = "background-color:#fdd">            boost::asio::placeholders::bytes_transferred)));</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::OnClose
+ *
+ *    Callback called after writing the close frame.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::OnClose(const boost::system::error_code&amp; e, std::size_t bytesWritten)
+<span style = "background-color:#fdd">{
+   boost::mutex::scoped_lock guard(mLock);</span>
+
+<span style = "background-color:#fdd">   if (e) {</span>
+      LOG_ERROR(mLog, "WebSocket %p: Error sending close frame: %d [%s: %s]",
+<span style = "background-color:#fdd">                this, e.value(), e.category().name(), e.message().c_str());
+   } else {
+      LOG_INFO(mLog, "WebSocket %p: Sending close frame succeeded", this);</span>
+   }
+
+<span style = "background-color:#fdd">   if (mPeerInitiatedClose || e) {</span>
+      LOG_INFO(mLog, "WebSocket %p: Peer's initiated close request. ",
+               "Acknowledgement (close frame) sent or error while sending it. "
+<span style = "background-color:#fdd">               "Finishing websocket close.", this);
+      boost::system::error_code cr(mPeerCloseStatus, mErrorCategory);
+      FinishClose(cr, true);
+      return;</span>
+   }
+
+<span style = "background-color:#fdd">   if (!mReadInProgress) {</span>
+      LOG_INFO(mLog, "WebSocket %p: We initiated the close, now waiting for "
+<span style = "background-color:#fdd">               "(or decode) close frame acknowledgement from peer.", this);
+      DecodeMore(0, true);
+   } else {</span>
+      LOG_INFO(mLog, "WebSocket %p: We initiated the close while read is in "
+<span style = "background-color:#fdd">               "progress.", this);</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::FinishClose
+ *
+ *    Finish the close process.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::FinishClose(const boost::system::error_code&amp; e, bool callReadCb)
+<span style = "background-color:#fdd">{</span>
+   LOG_DEBUG(mLog, "WebSocket %p: callReadCb:%s.", this,
+<span style = "background-color:#fdd">             callReadCb ? "True" : "False");</span>
+
+<span style = "background-color:#fdd">   if (mIsClosed) {
+      LOG_WARN(mLog, "WebSocket %p: Already closed.", this);
+      return;</span>
+   }
+
+   // Clean up the write queue.
+<span style = "background-color:#fdd">   while (!mWriteQ.empty()) {
+      WriteData&amp; wd = mWriteQ.back();
+      if (wd.inProgress) {</span>
+         /*
+          * This write is in progress and we can't delete it out
+          * from under Boost.Asio. Its callback will be called shortly.
+          * Then it will be cleaned up and the reference to the higher
+          * level write callback will be dropped and this WebSocket will
+          * be destroyed via the shared_ptr interface.
+          */
+<span style = "background-color:#fdd">         ASSERT(mWriteQ.size() == 1);</span>
+         break;
+      }
+      // Allow the user to free this.
+<span style = "background-color:#fdd">      wd.cb(e, 0, wd.userBuf);
+      delete wd.encodedBuf;
+      mWriteQ.pop_back();</span>
+   }
+
+<span style = "background-color:#fdd">   if (callReadCb) {
+      if (mReadCallback) {
+         mReadCallback(e, 0);
+      } else {
+         LOG_WARN(mLog, "WebSocket %p: ReadCallback is NULL.", this);</span>
+      }
+   }
+
+<span style = "background-color:#fdd">   mReadCallback = NULL; // Drop the reference.</span>
+
+   /*
+    * Reset the connection ctrl and the redirect connection so the
+    * ref count will drop.
+    * Don't have this in Close() because we expect mConnectionCtrl
+    * and mRedirectWebSocket might be required until FinishClose().
+    */
+<span style = "background-color:#fdd">   if (mConnectionCtrl) {</span>
+      LOG_DEBUG(mLog, "Resetting/releasing connection ctrl %p",
+<span style = "background-color:#fdd">                mConnectionCtrl.get());</span>
+
+<span style = "background-color:#fdd">      mConnectionCtrl.reset();</span>
+   }
+
+<span style = "background-color:#fdd">   if (mRedirectWebSocket) {</span>
+      LOG_DEBUG(mLog, "WebSocket %p: Resetting/releasing redirect %p",
+<span style = "background-color:#fdd">                this, mRedirectWebSocket.get());</span>
+
+<span style = "background-color:#fdd">      mRedirectWebSocket.reset();</span>
+   }
+
+   // Mark ourselves as closed.
+<span style = "background-color:#fdd">   mIsClosed = true;
+   LOG_INFO(mLog, "WebSocket %p: Closed.", this);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::GetUtrl
+ *
+ *    Get URL string
+ *
+ * Results:
+ *    URL string
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+const std::string&amp;
+WebSocket::GetUrl() const
+<span style = "background-color:#fdd">{
+   return mUrl;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::GetWebCookie
+ *
+ *    Get Web Cookie
+ *
+ * Results:
+ *    Web Cookie string
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+const std::string&amp;
+WebSocket::GetWebCookie() const
+<span style = "background-color:#fdd">{
+   return mCookie;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::GetConnectionSharedPtr
+ *
+ *    Get the connection associated with this web socket object
+ *
+ * Results:
+ *    Connection shared pointer
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+Connection_ptr
+WebSocket::GetConnectionSharedPtr()
+<span style = "background-color:#fdd">{
+   return mConnection;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::IsSSL
+ *
+ *    Is this websocket connection using SSL
+ *
+ * Results:
+ *    true/false (SSL connection)
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::IsSSL()
+<span style = "background-color:#fdd">{
+   return mIsSsl;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::DoReadData
+ *
+ *    Request an async read to be queued on the websocket that is held by this
+ *    connection object.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::DoReadData()
+<span style = "background-color:#fdd">{</span>
+   // If the buffer has not been allocated, allocate it here.
+   // TODO: Do this once in some initialization step rather than here
+<span style = "background-color:#fdd">   AllocRecvBuffer();</span>
+
+   //LOG_INFO(mLog, "WebSocket::DoReadData() start, this %p other %p mRecvBuf %p",
+   //         this, mRedirectWebSocket.get(), mRecvBuf);
+
+<span style = "background-color:#fdd">   if (mBytesRead &gt; 0) {</span>
+      LOG_DEBUG(mLog, "WebSocket %p: Starting, bytesRead %lu.",
+<span style = "background-color:#fdd">                this, (unsigned long) mBytesRead);
+      std::size_t bytesRead = mBytesRead;
+      mBytesRead = 0;</span>
+      const boost::system::error_code e =
+<span style = "background-color:#fdd">         boost::system::errc::make_error_code(boost::system::errc::success);
+      NotifyReadDataReady(e, bytesRead);
+      return;</span>
+   }
+
+   RecvPartial(
+      mRecvBuf,
+      MAX_RECV_BUF_SIZE,
+      boost::bind(&amp;WebSocket::NotifyReadDataReady,
+                  boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+                  boost::asio::placeholders::error,
+<span style = "background-color:#fdd">                  boost::asio::placeholders::bytes_transferred));</span>
+
+   //LOG_INFO(mLog, "WebSocket::DoReadData() end, this %p other %p",
+   //         this, mRedirectWebSocket.get());
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::WaitForDataAvailableASync
+ *
+ *    Do an Async wait for data to be available on this websocket. This is
+ *    used to handle the UDP fallback scenario, where we might start receiving
+ *    data over the TCP connection even though UDP has been negotiated.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::WaitForDataAvailableASync()
+<span style = "background-color:#fdd">{</span>
+   // If the buffer has not been allocated, allocate it here.
+   // TODO: Do this once in some initialization step rather than here
+<span style = "background-color:#fdd">   AllocRecvBuffer();</span>
+
+   LOG_DEBUG(mLog, "WebSocket %p: Queue up callback in case data is available.",
+<span style = "background-color:#fdd">             this);</span>
+
+   RecvPartial(
+      mRecvBuf,
+      MAX_RECV_BUF_SIZE,
+      boost::bind(&amp;WebSocket::NotifyDataAvailable,
+                  boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+                  boost::asio::placeholders::error,
+<span style = "background-color:#fdd">                  boost::asio::placeholders::bytes_transferred));</span>
+
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "WebSocket %p: Callback queued up.", this);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::DummyWaitForData
+ *
+ *    Dummy wait for data. This is purely for queueing up a read so the
+ *    websocket reference stays alive.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::DummyWaitForData()
+<span style = "background-color:#fdd">{</span>
+   // If the buffer has not been allocated, allocate it here.
+   // TODO: Do this once in some initialization step rather than here
+<span style = "background-color:#fdd">   AllocRecvBuffer();</span>
+
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "WebSocket %p: Queue up dummy read callback.", this);</span>
+
+   RecvPartial(
+      mRecvBuf,
+      MAX_RECV_BUF_SIZE,
+      boost::bind(&amp;WebSocket::DummyReadDataReady,
+                  boost::dynamic_pointer_cast&lt;WebSocket&gt;(shared_from_this()),
+                  boost::asio::placeholders::error,
+<span style = "background-color:#fdd">                  boost::asio::placeholders::bytes_transferred));</span>
+
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "WebSocket %p: Dummy callback queued up.", this);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::SendData
+ *
+ *    Send data over the websocket.
+ *
+ * Results:
+ *    true on success, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::SendData(const char* buf,      // IN
+                    std::size_t len,      // IN
+                    WebSocketWriteCb cb)  // IN
+<span style = "background-color:#fdd">{
+   return Send(buf, len, cb);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::SetConnectionCtrl
+ *
+ *    Provide the connection with a shared pointer to its controller.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::SetConnectionCtrl(boost::shared_ptr&lt;IConnectionCtrl&gt; connectionCtrl) // IN
+<span style = "background-color:#fdd">{
+   mConnectionCtrl = connectionCtrl;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::SetRedirectWebSocket
+ *
+ *    Set the redirect websocket. For the client facing websocket,
+ *    the loopback is the redirect websocket, and vice versa.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::SetRedirectWebSocket(IWebSocket_ptr pWS)  // IN
+<span style = "background-color:#fdd">{
+   mRedirectWebSocket = pWS;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::SetClientFacing
+ *
+ *    Set a flag to indicate if this is a client facing websocket or not.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::SetClientFacing(const bool bClientFacing)  // IN
+<span style = "background-color:#fdd">{
+   mIsClientFacing = bClientFacing;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::IsClientFacing
+ *
+ *    Check if this is a client facing websocket or not.
+ *
+ * Results:
+ *    true if client facing websocket, false if loopback websocket.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::IsClientFacing()
+<span style = "background-color:#fdd">{
+   return mIsClientFacing;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::CreateLoopbackWebSocket
+ *
+ *    Create a new websocket.
+ *
+ * Results:
+ *    Shared pointer to the newly created websocket. This is being
+ *    returned via the argument rather than return type so that the dummy
+ *    implementation in the worker becomes more straight-forward.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::CreateLoopbackWebSocket(const DWORD sessionId,               // IN
+                                   std::string&amp; workerIpString,         // IN
+                                   std::string&amp; workerPortString,       // IN
+                                   IWebSocket_ptr&amp; webSocketSharedPtr)  // OUT
+<span style = "background-color:#fdd">{</span>
+   LOG_INFO(mLog, "WebSocket %p: Creating loopback ws, SessionID:%lu.",
+<span style = "background-color:#fdd">            this, sessionId);</span>
+   /*
+    * The loopback will never have to use the websocket sink or dispatcher
+    * interfaces, so just set them as NULL.
+    */
+   // We don't need ssl, so perhap we can find a way to avoid sslCtx. HttpServer
+   // does more setup on this sslCtx.
+   // The loopback doesn't need the authenticate manager so set to NULL. Once this
+   // instantation code moves out of here, it won't be needed anyway
+<span style = "background-color:#fdd">   boost::asio::io_service&amp; ioService = mConnection-&gt;GetIOService();</span>
+
+<span style = "background-color:#fdd">   boost::asio::ssl::context sslCtx(ioService, boost::asio::ssl::context::sslv23);</span>
+
+<span style = "background-color:#fdd">   Connection_ptr loopbackConnection;</span>
+   loopbackConnection.reset(
+      new Connection(ioService, sslCtx,
+                     NULL /*mDispatcher*/, NULL /*mAuthenticateMgr*/,
+<span style = "background-color:#fdd">                     false /*ssl*/, false /*udpEnabled*/));</span>
+
+   LOG_INFO(mLog, "WebSocket %p: LoopbackConnection %p (shared ptr %p)",
+<span style = "background-color:#fdd">            this, loopbackConnection.get(), loopbackConnection);</span>
+
+<span style = "background-color:#fdd">   const char *workerIpCStr   = workerIpString.c_str();
+   const char *workerPortCStr = workerPortString.c_str();</span>
+   LOG_DEBUG(mLog, "WebSocket %p: Trying to resolve worker IP:%s Port:%s.",
+<span style = "background-color:#fdd">             this, workerIpCStr, workerPortCStr);</span>
+
+<span style = "background-color:#fdd">   boost::asio::ip::tcp::resolver Resolver(ioService);
+   boost::asio::ip::tcp::resolver::query Query(workerIpString, workerPortString);
+   boost::asio::ip::tcp::resolver::iterator endpointIterator = Resolver.resolve(Query);</span>
+   LOG_DEBUG(mLog, "WebSocket %p: Trying to connect to IP:%s Port:%s.",
+<span style = "background-color:#fdd">             this, workerIpCStr, workerPortCStr);
+   boost::system::error_code ec;
+   boost::asio::connect(loopbackConnection-&gt;GetTCPSocket(), endpointIterator, ec);
+   if (ec) {
+      LOG_ERROR(mLog,"Error connection to remote endpoint %s ", ec.message().c_str());
+      return false;</span>
+   }
+   LOG_DEBUG(mLog, "WebSocket %p: Finished doing a connect to IP:%s Port:%s.",
+<span style = "background-color:#fdd">             this, workerIpCStr, workerPortCStr);</span>
+
+<span style = "background-color:#fdd">   std::ostringstream myLocalEndpoint;
+   myLocalEndpoint &lt;&lt; loopbackConnection-&gt;GetTCPSocket().local_endpoint();
+   std::ostringstream clientEndpoint;
+   clientEndpoint &lt;&lt; loopbackConnection-&gt;GetTCPSocket().remote_endpoint();</span>
+   LOG_INFO(mLog, "WebSocket %p: Local endpoint %s connected to "
+            "remote endpoint %s", this, myLocalEndpoint.str().c_str(),
+<span style = "background-color:#fdd">            clientEndpoint.str().c_str());</span>
+
+   // Now create the loopback websocket
+
+   /*
+    * The only parameter we need to propagate from the client facing
+    * connection to the loopback connection is the subProtocol
+    * (binary, vvc, etc.)
+    */
+   // Probably not needed, but just set the subprotocol to be consistent.
+<span style = "background-color:#fdd">   loopbackConnection-&gt;SetSubProtocol(this-&gt;GetSubProtocol());</span>
+
+<span style = "background-color:#fdd">   http2::IWebSocket *wsLoopback = loopbackConnection-&gt;CreateWebSocket();
+   webSocketSharedPtr.reset(wsLoopback);</span>
+
+   LOG_INFO(mLog, "WebSocket %p: Finished creating loopback ws %p, "
+            "connection %p, SessionID:%lu.", this, wsLoopback,
+<span style = "background-color:#fdd">            loopbackConnection.get(), sessionId);</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::GetVAuth
+ *
+ *    Get the vAuth associated with this connection.
+ *
+ * Results:
+ *    vAuth.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+WebSocket::GetVAuth()
+<span style = "background-color:#fdd">{
+   return mConnection-&gt;GetVAuth();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::IsClosingOrClosed
+ *
+ *    Check whether the websocket is in the process of closing.
+ *
+ * Results:
+ *    vAuth.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::IsClosingOrClosed()
+<span style = "background-color:#fdd">{
+   return (mIsClosing || mIsClosed);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::SetClientConnectedToWorker
+ *
+ *    Mark that the client has connected to the worker, so this websocket
+ *    should not be used to carry data.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::SetClientConnectedToWorker()
+<span style = "background-color:#fdd">{</span>
+   LOG_INFO(mLog, "Websocket %p is invalid since client connected to worker",
+<span style = "background-color:#fdd">            this);
+   mClientConnectedToWorker = true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WebSocket::IsClientConnectedToWorker
+ *
+ *    Return whether client is connected directly to worker.
+ *
+ * Results:
+ *    vAuth.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::IsClientConnectedToWorker()
+<span style = "background-color:#fdd">{
+   return mClientConnectedToWorker;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::ws::WebSocket::EnableStatistics
+ *
+ *    Enable the connection statistic data collection
+ *
+ * Results:
+ *    true/false
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::EnableStatistics()
+<span style = "background-color:#fdd">{
+   return mConnection-&gt;EnableStatistics();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::GetStatistics
+ *
+ *    Get connection statistic information
+ *
+ * Results:
+ *    true/false
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::GetStatistics(Connection::Statistics&amp; stats) const
+<span style = "background-color:#fdd">{
+   return mConnection-&gt;GetStatistics(stats);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::GetSubProtocol
+ *
+ *    Get Subprotocol string
+ *
+ * Results:
+ *    Sub Protocol string
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+WebSocket::GetSubProtocol()
+<span style = "background-color:#fdd">{
+   return mConnection-&gt;GetSubProtocol();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::GetLock
+ *
+ *    Get lock used with this object
+ *
+ * Results:
+ *    used synchronization lock
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+boost::mutex&amp;
+WebSocket::GetLock()
+<span style = "background-color:#fdd">{
+   return mLock;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::IsRepeatedEmptyRead
+ *
+ *    Returns whether we have at least mMaxEmptyReads consecutive empty reads.
+ *
+ * Results:
+ *    true/false
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::IsRepeatedEmptyRead(std::size_t bytesRead) // IN
+<span style = "background-color:#fdd">{
+   if (bytesRead) {
+      if (mRunningEmptyReadCount &gt; 0) {</span>
+         Warning("Websocket %p: read %u bytes after %d empty reads.\n",
+<span style = "background-color:#fdd">                 this, bytesRead, mRunningEmptyReadCount);</span>
+      }
+<span style = "background-color:#fdd">      mRunningEmptyReadCount = 0;
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   ++mRunningEmptyReadCount;</span>
+   LOG_TRACE(mLog, "WebSocket %p: empty read %d.",
+<span style = "background-color:#fdd">             this, mRunningEmptyReadCount);</span>
+
+<span style = "background-color:#fdd">   return mRunningEmptyReadCount &gt;= mMaxEmptyReads;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::HandleConnectionError
+ *
+ *    Handles network connection error.
+ *
+ * Results:
+ *    true/false
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+WebSocket::HandleConnectionError()
+<span style = "background-color:#fdd">{
+   bool bReturn = false;</span>
+
+<span style = "background-color:#fdd">   if (mConnectionCtrl) {</span>
+      /*
+       * Gets vAuth for the websocket, if empty goes to the redirect websocket,
+       * as vAuth is only stored for the client facing websocket.
+       */
+<span style = "background-color:#fdd">      std::string vAuth = GetVAuth();
+      if (vAuth.empty()) {</span>
+         LOG_DEBUG(mLog, "vAuth of WebSocket %p is empty, retrieving vAuth from "
+<span style = "background-color:#fdd">                         "redirect WebSocket %p.", this, mRedirectWebSocket.get());
+         vAuth = mRedirectWebSocket-&gt;GetVAuth();</span>
+      }
+
+<span style = "background-color:#fdd">      if (vAuth.empty()) {
+         LOG_ERROR(mLog, "Failed to retrieve vAuth for WebSocket %p.", this);
+         return false;</span>
+      }
+
+<span style = "background-color:#fdd">      bReturn = mConnectionCtrl-&gt;OnConnectionError(vAuth);</span>
+      LOG_INFO(mLog, "WebSocket %p: OnConnectionError() %s.",
+<span style = "background-color:#fdd">                     this, bReturn ? "succeeded" : "failed");
+   } else {</span>
+      LOG_ERROR(mLog, "WebSocket %p: ConnectionCtrl interface pointer is "
+<span style = "background-color:#fdd">                      "NULL.", this);</span>
+   }
+
+<span style = "background-color:#fdd">   return bReturn;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * http2::WebSocket::GetClientConnectionInfo
+ *
+ *    Get client connection information
+ *
+ * Results:
+ *    None
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WebSocket::GetClientConnectionInfo(
+                               ClientConnectionInfo&amp; clientConnectionInfo) const
+<span style = "background-color:#fdd">{
+   mConnection-&gt;GetClientConnectionInfo(clientConnectionInfo);
+}</span>
+
+} // namespace http2</pre>
+	</body>
+</html>

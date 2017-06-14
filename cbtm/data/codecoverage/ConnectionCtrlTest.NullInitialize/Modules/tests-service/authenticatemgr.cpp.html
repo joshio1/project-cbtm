@@ -1,0 +1,409 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>authenticatemgr.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2014-2015, 2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * Authenticate.cpp --
+ *
+ *    Module that performs authentication.
+ */
+
+// appblast/pipelib
+#include "PipeCommon.h"
+
+// appblast/common
+#include "ConsoleState.h"
+
+// appblast/service
+#include "AuthenticateMgr.h"
+#include "include/IWorkerSessionMgr.h"
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::Create --
+ *
+ *      Create a new instance of Authenticate.
+ *      TODO: It is not yet clear whether there is any benefit to making
+ *      the Create() use a static member to enforce the singleton instance.
+ *      This has the complication of requiring explicit deletion, especially
+ *      for unit tests, via some sort of DeleteInstance(), otherwise we
+ *      end up with a dangling pointer to the singleton in AuthenticateMgr.
+ *      Further, using a singleton pattern with a static instance that is never
+ *      explicitly cleaned up means that we need to use a Get\GetInstance
+ *      mechanism of accessing the pointer, which has the side effect of
+ *      establishing indirect dependencies between modules. Until we figure
+ *      out how this should look, just keep it simple for now. The single
+ *      instance will be enforced in MainAppService.
+ *
+ * Results:
+ *      New Authenticate instance.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+IAuthenticateMgr*
+AuthenticateMgr::Create()
+{
+   return new AuthenticateMgr();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::AuthenticateMgr
+ *
+ *    Constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+AuthenticateMgr::AuthenticateMgr()
+   : mLog(log4cxx::Logger::getLogger("authenticatemgr")),
+     mWorkerSessionMgr(NULL)
+{
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::~AuthenticateMgr
+ *
+ *    Destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+AuthenticateMgr::~AuthenticateMgr()
+{
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::Initialize
+ *
+ *    Perform any needed initialization.
+ *
+ * Results:
+ *    true if the initialization succeeded, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+AuthenticateMgr::Initialize(IWorkerSessionMgr* pWorkerSessionMgr)       // IN
+<span style = "background-color:#fdd">{
+   if (pWorkerSessionMgr == NULL) {
+      LOG_ERROR(mLog, "NULL WorkerIPC interface pointer");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   mWorkerSessionMgr = pWorkerSessionMgr;</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::Release
+ *
+ *    Perform any needed cleanup.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+AuthenticateMgr::Release()
+<span style = "background-color:#fdd">{</span>
+   /*
+    * Don't delete (just set to NULL), since we are just passed the interfaces
+    * in Initialize and we don't own the objects
+    */
+<span style = "background-color:#fdd">   mWorkerSessionMgr = NULL;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::ProcessVAuth --
+ *
+ *    Ask the worker to process the vAuth.
+ *
+ * Results:
+ *    true on success, false on failure.
+ *    On success, reconnectCookie will be updated with a non-empty string.
+ *    On failure, reconnectCookie will be an empty string.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+AuthenticateMgr::ProcessVAuth(const std::string&amp; vAuth,         // IN
+                              const std::string&amp; secret,        // IN
+                              const std::string&amp; requestCookie, // IN
+                              std::string&amp; reconnectCookie)     // OUT
+<span style = "background-color:#fdd">{</span>
+   LOG_INFO(mLog, "Begin: VAuth %s, RouteSpecifier %s, ReconnectCookie %s",
+            Log_Token(vAuth).c_str(),
+            Log_RouteSpecifier(secret).c_str(),
+<span style = "background-color:#fdd">            Log_Token(requestCookie).c_str());</span>
+
+<span style = "background-color:#fdd">   reconnectCookie = "";</span>
+
+<span style = "background-color:#fdd">   if (!mWorkerSessionMgr) {
+      LOG_ERROR(mLog, "AuthenticateMgr has not been initialized.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::string cmd = pipelib::ABIPC_PROCESS_TOKEN;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += vAuth;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += secret;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += requestCookie;</span>
+
+<span style = "background-color:#fdd">   DWORD sessionId = mWorkerSessionMgr-&gt;GetWTSSessionId(vAuth);
+   if (sessionId == INVALID_TS_SESSION_ID) {</span>
+      LOG_ERROR(mLog, "Unable to retrieve WTSSessionID for vAuth %s.",
+<span style = "background-color:#fdd">                Log_Token(vAuth).c_str());
+      return false;</span>
+   }
+   LOG_INFO(mLog, "Found SessionID:%lu for vAuth:%s.",
+<span style = "background-color:#fdd">            sessionId, Log_Token(vAuth).c_str());</span>
+
+   if (!mWorkerSessionMgr-&gt;SendMessageToWorker(cmd, sessionId, false,
+<span style = "background-color:#fdd">                                               reconnectCookie)) {
+      LOG_ERROR(mLog, "SendMessageToWorker() failed for PROCESS_TOKEN.");
+      return false;</span>
+   }
+
+   LOG_INFO(mLog, "End: ReconnectCookie:%s.",
+<span style = "background-color:#fdd">            Log_Token(reconnectCookie).c_str());
+   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::CheckCookie --
+ *
+ *    Ask the worker to check the cookie.
+ *    TODO: The functions below have a very similar pattern, so they could
+ *    easily be re-factored to share some of their code.
+ *
+ * Results:
+ *    true if cookie checked out ok, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+AuthenticateMgr::CheckCookie(const std::string&amp; cookie,   // IN
+                             const std::string&amp; secret,   // IN
+                             const std::string&amp; vAuth)    // IN
+<span style = "background-color:#fdd">{
+   if (!mWorkerSessionMgr) {
+      LOG_ERROR(mLog, "AuthenticateMgr has not been initialized.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   DWORD wtsSessionId = mWorkerSessionMgr-&gt;GetWTSSessionId(vAuth);
+   if (wtsSessionId == INVALID_TS_SESSION_ID) {</span>
+      LOG_ERROR(mLog, "Unable to retrieve WTSSessionID for vAuth %s.",
+<span style = "background-color:#fdd">                Log_Token(vAuth).c_str());
+      return false;</span>
+   }
+   LOG_INFO(mLog, "Found WTSSessionID:%lu for cookie:%s secret:%s vAuth:%s.",
+            wtsSessionId, Log_Token(cookie).c_str(), Log_Token(secret).c_str(),
+<span style = "background-color:#fdd">            Log_Token(vAuth).c_str());</span>
+
+<span style = "background-color:#fdd">   std::string checkCookieCmd = pipelib::ABIPC_CHECK_COOKIE;
+   std::string cmd = checkCookieCmd;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += cookie;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += secret;</span>
+
+<span style = "background-color:#fdd">   std::string response = "";</span>
+   if (!mWorkerSessionMgr-&gt;SendMessageToWorker(cmd, wtsSessionId,
+<span style = "background-color:#fdd">                                               false, response)) {</span>
+      LOG_ERROR(mLog, "Failed sending command:%s for cookie:%s to worker.",
+                pipelib::GetCommandString(checkCookieCmd),
+<span style = "background-color:#fdd">                Log_Token(cookie).c_str());
+      return false;
+   } else if (response.empty()) {</span>
+      LOG_ERROR(mLog, "Succeeded sending command:%s for cookie:%s to worker, "
+                "but response was empty.",
+                pipelib::GetCommandString(checkCookieCmd),
+<span style = "background-color:#fdd">                Log_Token(cookie).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::GrabCookie --
+ *
+ *    Ask the worker to grab the cookie.
+ *
+ * Results:
+ *    true if cookie was grabbed successfully, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+AuthenticateMgr::GrabCookie(const std::string&amp; cookie,  // IN
+                            const std::string&amp; vAuth)   // IN
+<span style = "background-color:#fdd">{
+   if (!mWorkerSessionMgr) {
+      LOG_ERROR(mLog, "AuthenticateMgr has not been initialized.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   DWORD wtsSessionId = mWorkerSessionMgr-&gt;GetWTSSessionId(vAuth);
+   if (wtsSessionId == INVALID_TS_SESSION_ID) {</span>
+      LOG_ERROR(mLog, "Unable to retrieve WTSSessionID for vAuth %s.",
+<span style = "background-color:#fdd">                Log_Token(vAuth).c_str());
+      return false;</span>
+   }
+   LOG_INFO(mLog, "Found WTSSessionID:%lu for cookie:%s vAuth:%s.",
+<span style = "background-color:#fdd">            wtsSessionId, Log_Token(cookie).c_str(), Log_Token(vAuth).c_str());</span>
+
+<span style = "background-color:#fdd">   std::string grabCookieCmd = pipelib::ABIPC_GRAB_COOKIE;
+   std::string cmd = grabCookieCmd;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += cookie;</span>
+
+<span style = "background-color:#fdd">   std::string response = "";</span>
+   if (!mWorkerSessionMgr-&gt;SendMessageToWorker(cmd, wtsSessionId,
+<span style = "background-color:#fdd">                                               false, response)) {</span>
+      LOG_ERROR(mLog, "Failed sending command:%s for cookie:%s to worker.",
+                pipelib::GetCommandString(grabCookieCmd),
+<span style = "background-color:#fdd">                Log_Token(cookie).c_str());
+      return false;
+   } else if (response.empty()) {</span>
+      LOG_ERROR(mLog, "Succeeded sending command:%s for cookie:%s to worker, "
+                "but response was empty.",
+                pipelib::GetCommandString(grabCookieCmd),
+<span style = "background-color:#fdd">                Log_Token(cookie).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * AuthenticateMgr::DropCookie --
+ *
+ *    Ask the worker to drop the cookie.
+ *
+ * Results:
+ *    true if cookie dropped successfully, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+AuthenticateMgr::DropCookie(const std::string&amp; cookie,  // IN
+                            const std::string&amp; vAuth)   // IN
+<span style = "background-color:#fdd">{
+   if (!mWorkerSessionMgr) {
+      LOG_ERROR(mLog, "AuthenticateMgr has not been initialized.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   DWORD wtsSessionId = mWorkerSessionMgr-&gt;GetWTSSessionId(vAuth);
+   if (wtsSessionId == INVALID_TS_SESSION_ID) {</span>
+      LOG_ERROR(mLog, "Unable to retrieve WTSSessionID for vAuth %s.",
+<span style = "background-color:#fdd">                Log_Token(vAuth).c_str());
+      return false;</span>
+   }
+   LOG_INFO(mLog, "Found WTSSessionID:%lu for cookie:%s vAuth:%s.",
+<span style = "background-color:#fdd">            wtsSessionId, Log_Token(cookie).c_str(), Log_Token(vAuth).c_str());</span>
+
+<span style = "background-color:#fdd">   std::string dropCookieCmd = pipelib::ABIPC_DROP_COOKIE;
+   std::string cmd = dropCookieCmd;
+   cmd += pipelib::ABIPC_MSG_DELIM;
+   cmd += cookie;</span>
+
+<span style = "background-color:#fdd">   std::string response = "";</span>
+   if (!mWorkerSessionMgr-&gt;SendMessageToWorker(cmd, wtsSessionId,
+<span style = "background-color:#fdd">                                               false, response)) {</span>
+      LOG_ERROR(mLog, "Failed sending command:%s for cookie:%s to worker.",
+                pipelib::GetCommandString(dropCookieCmd),
+<span style = "background-color:#fdd">                Log_Token(cookie).c_str());
+      return false;
+   } else if (response.empty()) {</span>
+      LOG_ERROR(mLog, "Succeeded sending command:%s for cookie:%s to worker, "
+                "but response was empty.",
+                pipelib::GetCommandString(dropCookieCmd),
+<span style = "background-color:#fdd">                Log_Token(cookie).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * IAuthenticateMgr::CreateInstance --
+ *
+ *    Create a new instance of Authenticate.
+ *
+ * Results:
+ *    Interface pointer.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+IAuthenticateMgr*
+IAuthenticateMgr::CreateInstance()
+<span style = "background-color:#fdd">{
+   return AuthenticateMgr::Create();
+}</span></pre>
+	</body>
+</html>

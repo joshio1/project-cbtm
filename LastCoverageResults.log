@@ -1,0 +1,58 @@
+[2017-06-07 17:32:03] [info] Start Program:
+Path:"C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\tests-service.exe"
+Arguments:--gtest_output=xml:C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\codecoverage\WorkerSessionMgrTest.RecordAndValidateMapData\gtest_result.xml --gtest_filter=WorkerSessionMgrTest.RecordAndValidateMapData 
+Working directory: not set.
+
+Modules: Selected: tests-service.exe Excluded: 
+Sources: Selected: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\service Excluded: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\service\*.h 
+Log Level: Normal
+Cover Children: 0
+Aggregate by file: 1
+Export: Cobertura C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\codecoverage\WorkerSessionMgrTest.RecordAndValidateMapData\cobertura_output.xml Input coverage: 
+
+[2017-06-07 17:32:03] [info] Module: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\tests-service.exe is selected because it matches selected pattern: tests-service.exe
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\ntdll.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\kernel32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\KernelBase.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\winsxs\amd64_microsoft.vc90.crt_1fc8b3b9a1e18e3b_9.0.30729.6161_none_08e61857a83bc251\msvcr90.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\winsxs\amd64_microsoft.vc90.crt_1fc8b3b9a1e18e3b_9.0.30729.6161_none_08e61857a83bc251\msvcp90.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\log4cxx.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\advapi32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\msvcrt.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\sechost.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\rpcrt4.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\odbc32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\user32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\gdi32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\lpk.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\usp10.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\libexpatw.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\ws2_32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\nsi.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\IPHLPAPI.DLL is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\winnsi.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\ole32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\shell32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\shlwapi.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\wtsapi32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\gtest.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\gtest_main.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\sigc-2.0.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\libeay32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\ut\ssleay32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\mswsock.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\crypt32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\msasn1.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\imm32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\msctf.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\odbcint.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\cryptsp.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\rsaenh.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\cryptbase.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\profapi.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\winsta.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\ntmarta.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] Module: C:\Windows\System32\Wldap32.dll is skipped because it matches no selected patterns
+[2017-06-07 17:32:04] [info] ----------------------------------------------------
+[2017-06-07 17:32:04] [info] Cobertura report generated: C:\Users\Administrator\workspace\appblast-ut-cbtm\build-and-ut\win7x64-ut-cbtm\build\beta-x64\codecoverage\WorkerSessionMgrTest.RecordAndValidateMapData\cobertura_output.xml
+[2017-06-07 17:32:04] [info] ----------------------------------------------------

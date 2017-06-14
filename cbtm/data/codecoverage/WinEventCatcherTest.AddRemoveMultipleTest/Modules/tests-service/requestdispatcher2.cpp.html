@@ -1,0 +1,1341 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>requestdispatcher2.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2012-2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * RequestDispatcher2.cpp --
+ *
+ *    All HTTP requests come through this class. For each request, a handler is
+ *    located depending on the requested path and the HTTP method, and that
+ *    handler is used to process and reply to the request.
+ *
+ *    This dispatcher also handles common tasks such as authentication
+ *    of requests.
+ *
+ *    TODO: Instead of handlers registering a boolean for 'requires auth'
+ *    or not, have values for (a) no auth needed, (b) cookie needed,
+ *    (c) token needed, and (d) cookie or token needed. Perhaps...
+ */
+
+#include &lt;windows.h&gt;
+
+#include &lt;boost/algorithm/string.hpp&gt;
+#include &lt;boost/asio.hpp&gt;
+#include &lt;openssl/evp.h&gt;
+#include &lt;shlwapi.h&gt;
+
+// appblast/common
+#include "AbCertManager.h"
+#include "AbResult.h"
+#include "appBlastUtil.h"
+#include "ISubprotocol.h"
+#include "PersistentConfig.h"
+#include "wave/WaveBlast.h"
+
+//appblast/service
+#include "include/IWorkerSessionMgr.h"
+#include "MainAppService.h"
+#include "RequestDispatcher2.h"
+
+// TODO: This one needs to die:
+#include "HandlerImpl.h"
+#include "HandlerDefault.h"
+
+using std::tr1::shared_ptr;
+
+// From: http://tools.ietf.org/html/draft-ietf-hybi-thewebsocketprotocol-13#page-8
+<span style = "background-color:#dfd">static const std::string WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";</span>
+
+<span style = "background-color:#fdd">static const char* ToStr(ClientRequest::HttpVerb verb) {
+   switch (verb) {
+   case ClientRequest::GET: return "GET";
+   case ClientRequest::POST: return "POST";
+   case ClientRequest::PUT: return "PUT";</span>
+   }
+<span style = "background-color:#fdd">   AB_NOT_REACHED();</span>
+   return "";
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * class DispatchEntry --
+ *
+ *    When a URL is mapped to a IRequestHandler2, an entry is added to the
+ *    dispatch table. The order of entries in the table is important, since
+ *    entries added later can be more general than ones added earlier.
+ *
+ * ----------------------------------------------------------------------------
+ */
+class DispatchEntry
+{
+public:
+   /* Create a new entry. Entry becomes the owner of 'handler' */
+<span style = "background-color:#fdd">   DispatchEntry(IRequestHandler2 *handler,</span>
+                 const std::string&amp; path,
+                 int methods,
+                 bool auth)
+      : mHandler(handler), mPath(path), mMethods(methods), mAuth(auth) {
+<span style = "background-color:#fdd">      ASSERT(handler);
+      ASSERT(!path.empty());
+   }</span>
+
+   ~DispatchEntry() {
+   }
+
+   /* Does this handler require authentication? */
+   bool RequiresAuth() const {
+      return mAuth;
+   }
+
+   /* Does this handler handle the request? */
+   bool MatchesRequest(const std::string&amp; request,
+<span style = "background-color:#fdd">                       int methods) const {</span>
+      return ((methods &amp; mMethods) &gt; 0) &amp;&amp;
+             (request == mPath ||
+             (request + "/") == mPath ||
+             request == (mPath + "/") ||
+<span style = "background-color:#fdd">             PathMatchSpecA(request.c_str(), mPath.c_str()));
+   }</span>
+
+   /* Called only if MatchesRequest() returns true. */
+   bool HandleRequest(ClientRequest *request) {
+      bool handled = false;
+      switch (request-&gt;GetVerb()) {
+         case ClientRequest::GET:
+            handled = mHandler-&gt;HandleGet(request);
+            break;
+         case ClientRequest::POST:
+            handled = mHandler-&gt;HandlePost(request);
+            break;
+         case ClientRequest::PUT:
+            handled = mHandler-&gt;HandlePut(request);
+            break;
+      }
+      return handled;
+   }
+
+protected:
+   shared_ptr&lt;IRequestHandler2&gt; mHandler;
+   std::string mPath;
+   int mMethods;
+   bool mAuth;
+};
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::RequestDispatcher2() --
+ *
+ *    Create a new request dispatcher instance. All handlers are installed
+ *    during construction. Any errors are ignored (but will cause an assertion
+ *    failure in OBJ builds)
+ *
+ * ----------------------------------------------------------------------------
+ */
+
+RequestDispatcher2::RequestDispatcher2() // IN
+   : mConfig(NULL),
+     mConnectionCtrlMgr(NULL),
+     mLog(log4cxx::Logger::getLogger("RequestDispatcher2")),
+     mAbCertManager(NULL)
+<span style = "background-color:#fdd">{
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::Initialize() --
+ *
+ *    Initialize RequestDispatcher2
+ *
+ * Results:
+ *    True/False
+ *
+ * ----------------------------------------------------------------------------
+ */
+
+bool
+RequestDispatcher2::Initialize(IConnectionCtrlMgr *connectionCtrlMgr,
+                               PersistentConfig *config)
+<span style = "background-color:#fdd">{
+   if (!connectionCtrlMgr) {
+      LOG_ERROR(mLog, "Invalid Connection Control Manager");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   mConnectionCtrlMgr = connectionCtrlMgr;</span>
+
+<span style = "background-color:#fdd">   if (!config) {
+      LOG_ERROR(mLog, "Invalid config");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   mConfig = config;</span>
+
+<span style = "background-color:#fdd">   if (!InstallHandler(new HandlerImpl(), "certAccept.html", GET, false)) {
+      LOG_ERROR(mLog, "Unable to install certificate accept handler");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   if (!InstallHandler(new HandlerDefault(), "*", GET | POST | PUT, false)) {
+      LOG_ERROR(mLog, "Unable to install catch all handler");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   mAbCertManager = new AbCertManager(config, boost::asio::io_service());
+   if (mAbCertManager == NULL) {
+      LOG_ERROR(mLog, "Unable to instantiate AbCertManager.");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::~RequestDispatcher2() --
+ *
+ *    Delete a RequestDispatcher2 instance.
+ *
+ * ----------------------------------------------------------------------------
+ */
+RequestDispatcher2::~RequestDispatcher2()
+<span style = "background-color:#fdd">{</span>
+   // Table uses shared_ptr, no cleanup needed
+<span style = "background-color:#fdd">   mConnectionCtrlMgr = NULL;
+   mConfig = NULL;</span>
+
+<span style = "background-color:#fdd">   delete mAbCertManager;
+   mAbCertManager = NULL;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::Dispatch() --
+ *
+ *    Handle an incoming request: find a handler for it, check for any
+ *    required authentication, and let the handler deal with responding. A
+ *    response is always sent, even if there was no explicit handler.
+ *
+ *    This method takes ownership of the 'request' object (i.e. becomes
+ *    responsible for freeing it or making sure some other class frees it).
+ *
+ *    This is an element of the IRequestDispatcher interface.
+ *
+ * Results:
+ *    TODO: Not clear what the result should be: handled? responded?
+ * ----------------------------------------------------------------------------
+ */
+bool
+RequestDispatcher2::Dispatch(ClientRequest *request)  // IN
+<span style = "background-color:#fdd">{</span>
+   bool handled = false;
+   bool requestOwnershipLost = false;
+   DispatchEntry *entry = NULL;
+
+<span style = "background-color:#fdd">   ASSERT(request);</span>
+   if (!request) {
+      LOG_ERROR(mLog, "RequestDispatcher2::Dispatch got NULL request");
+      return false;
+   }
+
+<span style = "background-color:#fdd">   std::string path = request-&gt;GetRequestPath();</span>
+
+   LOG_DEBUG(mLog, "%s request for %s",
+<span style = "background-color:#fdd">             ToStr(request-&gt;GetVerb()), path.c_str());</span>
+
+   // Look for the first handler that matches the requested path
+<span style = "background-color:#fdd">   entry = FindTableEntryForRequest(path, request-&gt;GetVerb());</span>
+
+   // We can skip authentication iff we found a handler that exempts it
+<span style = "background-color:#fdd">   if ((entry == NULL) || entry-&gt;RequiresAuth()) {</span>
+      /*
+       * Check for authorization on any basis: Horizon (real and fake), View,
+       * or a cookie.  It's possible that we'll end up accepting the request
+       * anyway because it involves a path that doesn't need authentication,
+       * but always check for explicit authentication first because we need
+       * to give that logic the opportunity to trigger side effects on the
+       * session authentication state machine.
+       */
+
+<span style = "background-color:#fdd">      if (!AuthenticateRequest(request) &amp;&amp; !NoAuthNeeded(path)) {</span>
+         /*
+          * At this point, the request has failed to establish the required
+          * authentication.
+          */
+         LOG_WARN(mLog, "Unauthorized %s access to %s (origin %s)",
+                        ToStr(request-&gt;GetVerb()),
+                        path.c_str(),
+<span style = "background-color:#fdd">                        request-&gt;GetOrigin().c_str());</span>
+         request-&gt;GetResponse()-&gt;RespondWithText(IHttpResponse::FORBIDDEN, "",
+<span style = "background-color:#fdd">            "Not authorized");</span>
+         handled = true;
+<span style = "background-color:#fdd">         goto out;</span>
+      }
+   }
+
+   /* If no table entry was found, return a 404 here */
+<span style = "background-color:#fdd">   if (!entry) {</span>
+      LOG_WARN(mLog, "No handler for %s %s (origin %s)",
+                     ToStr(request-&gt;GetVerb()),
+                     path.c_str(),
+<span style = "background-color:#fdd">                     request-&gt;GetOrigin().c_str());</span>
+      request-&gt;GetResponse()-&gt;RespondWithText(IHttpResponse::NOT_FOUND, "",
+<span style = "background-color:#fdd">         "Not found");</span>
+      handled = true;
+<span style = "background-color:#fdd">      goto out;</span>
+   }
+
+<span style = "background-color:#fdd">   requestOwnershipLost = entry-&gt;HandleRequest(request);</span>
+   handled = true;
+
+out:
+<span style = "background-color:#fdd">   if (!requestOwnershipLost) {
+      delete request;</span>
+   }
+
+<span style = "background-color:#fdd">   return handled;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::InstallHandler() --
+ *
+ *    Convenience function to install/register a synchronous handler.
+ *
+ * Results:
+ *    True if installed, false if not (aborts for debug builds, since that
+ *    should not happen).
+ * ----------------------------------------------------------------------------
+ */
+bool
+RequestDispatcher2::InstallHandler(IRequestHandler2* handler,  // IN
+                                   const std::string&amp; path,    // IN
+                                   int methods,                // IN
+                                   bool auth)                  // IN
+<span style = "background-color:#fdd">{</span>
+   /* Is there a handler for that path already? */
+<span style = "background-color:#fdd">   if (FindTableEntryForRequest(path, methods) != NULL) {
+      LOG_ERROR(mLog, "Duplicate handler for path %s!", path.c_str());
+      AB_NOT_REACHED();</span>
+      delete handler;
+      return false;
+   }
+
+<span style = "background-color:#fdd">   DispatchEntry *entry = new DispatchEntry(handler, path, methods, auth);
+   shared_ptr&lt;DispatchEntry&gt; ptr(entry);
+   mDispatchTable.push_back(ptr);
+   return true;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::FindTableEntryForRequest() --
+ *
+ *    Look for the first (and only) handler, synchronous or asynchronous, which
+ *    is mapped to the requested URL path.
+ *
+ * Results:
+ *    The appropriate handler, or NULL if none found.
+ * ----------------------------------------------------------------------------
+ */
+DispatchEntry*
+RequestDispatcher2::FindTableEntryForRequest(const std::string&amp; path,   // IN
+                                             int methods)               // IN
+   const
+<span style = "background-color:#fdd">{</span>
+   DispatchTable::const_iterator i;
+
+<span style = "background-color:#fdd">   for (i = mDispatchTable.begin(); i != mDispatchTable.end(); ++i) {
+      shared_ptr&lt;DispatchEntry&gt; entry = *i;</span>
+
+<span style = "background-color:#fdd">      if (entry-&gt;MatchesRequest(path, methods)) {
+         return entry.get();</span>
+      }
+<span style = "background-color:#fdd">   }</span>
+
+<span style = "background-color:#fdd">   return NULL;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::ProcessHorizonToken() --
+ *
+ *    Look for a Horizon lightweight authorization token in the request, and
+ *    validate it against Horizon if found.
+ *
+ * Results:
+ *    True if a valid token was found, false if not.
+ * ----------------------------------------------------------------------------
+ */
+bool
+RequestDispatcher2::ProcessHorizonToken(ClientRequest *request,        // IN
+                                        const std::string&amp; hznToken)   // IN
+   const
+{
+   ASSERT(!hznToken.empty());
+   LOG_DEBUG(mLog, "Attempted %s access with Horizon lightweight token %s",
+             ToStr(request-&gt;GetVerb()),
+             Log_Token(hznToken).c_str());
+
+   bool success = false;
+
+#ifdef DEVELOPER_FRIENDLY
+   /* Developers can fake their own 'valid' LWTs */
+   std::string testToken;
+   if (mConfig != NULL) {
+      mConfig-&gt;GetString(CONFIG_HORIZON_FAKE_LWT, testToken);
+   }
+
+   if (!testToken.empty() &amp;&amp; testToken == hznToken) {
+      LOG_DEBUG(mLog, "Fake lightweight token checks out OK!");
+      success = true;
+   } else {
+      LOG_DEBUG(mLog, "Fake lightweight token is invalid!");
+   }
+#endif
+
+   if (success) {
+      // Set a cookie to allow future requests from this client
+      std::string authToken;
+      ASSERT(0);
+      //if (CookieJar::GetInstance()-&gt;CreateCookie(request-&gt;GetRouteSpecifier(), authToken)) {
+      //   request-&gt;GetResponse()-&gt;SetAuthCookieHeader(authToken);
+      //} else {
+      //   LOG_ERROR(mLog, "Unable to create cookie with routeSpecifier '%s'",
+      //                   Log_RouteSpecifier(request-&gt;GetRouteSpecifier()).c_str());
+      //   success = false;
+      //}
+   }
+
+   return success;
+}
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::ProcessVAuth() --
+ *
+ *    Look for a View authorization ticket in the request. If found, then we
+ *    try to swap that for a cookie.
+ *
+ * Results:
+ *    True if a valid token was found, false if not.
+ * ----------------------------------------------------------------------------
+ */
+
+bool
+RequestDispatcher2::ProcessVAuth(ClientRequest *request,          // IN
+                                 const std::string&amp; vAuth) const  // IN
+<span style = "background-color:#fdd">{
+   if (vAuth.empty()) {
+      LOG_ERROR(mLog, "Empty View authentication token");
+      return false;</span>
+   }
+
+   LOG_DEBUG(mLog, "Attempted %s access with vAuth %s",
+             ToStr(request-&gt;GetVerb()),
+<span style = "background-color:#fdd">             Log_Token(vAuth).c_str());</span>
+
+   /*
+    * Send the vAuth to the worker and ask the worker to validate it;
+    * The return value is the reconnect cookie.
+    */
+<span style = "background-color:#fdd">   std::string reconnectCookie = "";</span>
+   const std::string&amp; requestCookie = request-&gt;GetRequestCookie();
+   LOG_DEBUG(mLog, "RequestCookie string is %s",
+<span style = "background-color:#fdd">      Log_Token(requestCookie).c_str());</span>
+
+<span style = "background-color:#fdd">   IAuthenticateMgr *pAuthenticateMgr = request-&gt;GetAuthenticateMgr();</span>
+
+<span style = "background-color:#fdd">   if (pAuthenticateMgr) {</span>
+      if (!pAuthenticateMgr-&gt;ProcessVAuth(vAuth,
+                                          request-&gt;GetRouteSpecifier(),
+                                          requestCookie,
+<span style = "background-color:#fdd">                                          reconnectCookie)) {
+         LOG_ERROR(mLog, "ProcessVAuth failed.");
+         return false;</span>
+      }
+   }
+
+   /*
+    * Now that the ticket is claimed, we have a reconnect cookie
+    * that we should set as a session cookie.
+    */
+<span style = "background-color:#fdd">   request-&gt;GetResponse()-&gt;SetAuthCookieHeader(reconnectCookie);
+   request-&gt;SetRequestCookie(reconnectCookie);</span>
+
+<span style = "background-color:#fdd">   bool ret = request-&gt;IsAuthorized();
+   LOG_DEBUG(mLog, "Request is %sauthorized.", ret ? "" : "not ");</span>
+
+<span style = "background-color:#fdd">   return ret;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::AuthenticateRequest() --
+ *
+ *    Attempt to authenticate a request. We'll accept any of several
+ *    credentials: a Horizon lightweight token, a View token or a Blast
+ *    session cookie.
+ *
+ * Results:
+ *    Returns true if the request satisfies authentication requirements,
+ *    otherwise returns false.
+ * ----------------------------------------------------------------------------
+ */
+bool
+RequestDispatcher2::AuthenticateRequest(ClientRequest *request)   // IN
+<span style = "background-color:#fdd">{
+   LOG_INFO(mLog, "RequestDispatcher2::AuthenticateRequest");</span>
+
+<span style = "background-color:#fdd">   if (!request) {
+      LOG_ERROR(mLog, "NULL ClientRequest");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::string routeSpecifier = request-&gt;GetRouteSpecifier();
+   if (routeSpecifier.empty()) {
+      LOG_WARN(mLog, "No routeSpecifier provided in request");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::string hznToken = request-&gt;GetValue("token");
+   std::string vAuth = request-&gt;GetValue("vauth");</span>
+
+   /* If there is no session cookie, try set it from a GET paramter */
+<span style = "background-color:#fdd">   if (request-&gt;GetRequestCookie().empty()) {
+      request-&gt;SetRequestCookie(request-&gt;GetValue("session"));</span>
+   }
+
+<span style = "background-color:#fdd">   if (!hznToken.empty()) {</span>
+      /* Try Horizon... */
+#if 1    // Horizon LWT is not yet supported for RDSH
+<span style = "background-color:#fdd">      LOG_ERROR(mLog, "Fake Auth is invalid in an RDSH context");
+      return false;</span>
+#else    // Keep this in source for when we implement Hzn LWT for RDSH
+      if (ProcessHorizonToken(request, hznToken)) {
+         return true;
+      }
+      LOG_WARN(mLog, "Horizon token processing failed.");
+#endif
+<span style = "background-color:#fdd">   } else if (!vAuth.empty()) {</span>
+      /* Try View... */
+<span style = "background-color:#fdd">      if (ProcessVAuth(request, vAuth)) {
+         LOG_INFO(mLog, "vAuth processing succeeded.");
+         return true;</span>
+      }
+<span style = "background-color:#fdd">      LOG_WARN(mLog, "vAuth processing failed.");
+   } else {</span>
+      /* Prior authentication (do cookie and routeSpecifier match?) */
+<span style = "background-color:#fdd">      std::string sessionToken = request-&gt;GetRequestCookie();
+      IAuthenticateMgr *pAuthenticateMgr = request-&gt;GetAuthenticateMgr();
+      if (sessionToken.empty()) {
+         LOG_WARN(mLog, "No session cookie provided in request");
+      } else if (pAuthenticateMgr &amp;&amp;
+          pAuthenticateMgr-&gt;CheckCookie(sessionToken, routeSpecifier, vAuth)) {
+         LOG_INFO(mLog, "Implicit request authentication succeeded.");
+         return true;</span>
+      }
+<span style = "background-color:#fdd">      LOG_WARN(mLog, "Implicit request authentication failed.");
+   }</span>
+
+<span style = "background-color:#fdd">   return false;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::NoAuthNeeded() --
+ *    Check if a requested file/folder is restricted or unrestricted
+ *    Currently, the unrestricted folders include css/js/img
+ * Results:
+ *    true  -- no authentication needed
+ *    false -- authentication is needed
+ * ----------------------------------------------------------------------------
+ */
+
+bool
+RequestDispatcher2::NoAuthNeeded(const std::string&amp; path) const // IN
+<span style = "background-color:#fdd">{</span>
+   /* Favicon.ico and the following folders which include static files are not restricted */
+   int NumOfAllowedFolders = 4;
+<span style = "background-color:#fdd">   char * AllowedFolders[] = {"js/", "css/", "img/", "favicon.ico"};
+   for (int i = 0; i &lt; NumOfAllowedFolders; i++) {
+      if (path.compare(0, strlen(AllowedFolders[i]), AllowedFolders[i]) == 0) {</span>
+         return true;
+      }
+   }
+<span style = "background-color:#fdd">   return false;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::BuildUdpResponse() --
+ *
+ *    This function will be called if the server has enabled UDP on its end.
+ *    Check if client has sent flags to indicate that UDP is being used. If
+ *    so, then add the relevant headers to the websocket upgrade response. The
+ *    only way udp will be enabled is if the regkey is set on the server, AND
+ *    if UDP headers are found in the websocket request. These conditions
+ *    together indicate that UDP is supported by both server and client.
+ *
+ * Results:
+ *    true  -- Udp Upgrade handling was successful
+ *    false -- Udp Upgrade handling was not successful
+ *
+ * Side Effects:
+ *    If the client has sent a flag asking for UDP, then we insert UDP
+ *    meta-data into the websocket response and set udpHeadersPresent to true.
+ *    Otherwise, the websocket response is not altered and udpHeadersPresent is
+ *    set to false.
+ * ----------------------------------------------------------------------------
+ */
+
+void
+RequestDispatcher2::BuildUdpResponse(ClientRequest *cReq,      // IN
+                                     std::string serverIpAddr, // IN
+                                     int serverPort,           // IN
+                                     IHttpResponse *response,  // IN
+                                     std::string token,        // IN
+                                     bool&amp; udpHeadersPresent)  // OUT
+<span style = "background-color:#fdd">{
+   udpHeadersPresent = false;</span>
+
+   /*
+    * X-VMW-Blast-UDP-E2E-Req is the end to end request (from the client).
+    * It contains "enable" and "versions".
+    * X-VMW-Blast-UDP-Hop-Req is the hop request. It is sent by the prior hop.
+    * If there is no BSG, then this is directly whatever the client sends. If
+    * there is a BSG, then the BSG will change the header contents sent by the
+    * client, so that the server sees whatever the BSG has inserted. This only
+    * has a single value of "enable".
+    */
+<span style = "background-color:#fdd">   std::string udpE2EValue = cReq-&gt;GetHeaderValue("X-VMW-Blast-UDP-E2E-Req");
+   std::string udpHopValue = cReq-&gt;GetHeaderValue("X-VMW-Blast-UDP-Hop-Req");
+   if (udpE2EValue.empty() || udpHopValue.empty()) {
+      udpHeadersPresent = false;
+      LOG_DEBUG(mLog, "Empty / Missing UDP headers, nothing to do");
+      return;</span>
+   }
+
+   LOG_DEBUG(mLog, "UDP E2E Value: %s, UDP Hop Value: %s",
+<span style = "background-color:#fdd">             udpE2EValue.c_str(), udpHopValue.c_str());</span>
+
+   /*
+    * Parse the E2E header and figure out whether UDP is enabled, and what
+    * version the client is requesting. We only support one version right now,
+    * so validate that the version sent by the client is what we support.
+    */
+<span style = "background-color:#fdd">   std::vector&lt;KeyValuePair&gt; udpE2EPairs;
+   udpE2EPairs.clear();</span>
+   bool bRet;
+<span style = "background-color:#fdd">   bRet = AbUtil::GetCommaSeparatedKeyValuePairs(udpE2EValue, udpE2EPairs);
+   if (!bRet) {
+      LOG_ERROR(mLog, "Failed to parse the E2E key value pairs");
+      return;</span>
+   }
+   std::vector&lt;KeyValuePair&gt;::const_iterator e2eIter;
+
+<span style = "background-color:#fdd">   bool e2eEnabled = false;
+   bool versionMatch = false;
+   std::string finalSubprotocol = "";
+   for (e2eIter = udpE2EPairs.begin();
+        e2eIter != udpE2EPairs.end(); ++e2eIter) {</span>
+      LOG_DEBUG(mLog, "Key: %s, Value: %s",
+<span style = "background-color:#fdd">                e2eIter-&gt;key.c_str(), e2eIter-&gt;value.c_str());
+      if (0 == e2eIter-&gt;key.compare("enable")) {</span>
+         // If the key is 'enable', make sure the value is 1
+<span style = "background-color:#fdd">         e2eEnabled = (0 == e2eIter-&gt;value.compare("1"));
+      } else if (0 == e2eIter-&gt;key.compare("secondarysubprotocol")) {</span>
+         /*
+          * If the key is 'secondarysubprotocol', then the value is a list
+          * of secondary subprotocols that are supported by the client.
+          * Select one from this list and return that in finalSubprotocol.
+          * If we are unable to pick a value to use, the function below
+          * will return false and we would not use UDP.
+          */
+<span style = "background-color:#fdd">         versionMatch = ChooseSubProtocol(e2eIter-&gt;value, finalSubprotocol);</span>
+      }
+   }
+
+   // Now parse the Hop header and figure out whether UDP is enabled
+<span style = "background-color:#fdd">   std::vector&lt;KeyValuePair&gt; udpHopPairs;
+   udpHopPairs.clear();
+   bRet = AbUtil::GetCommaSeparatedKeyValuePairs(udpHopValue, udpHopPairs);
+   if (!bRet) {
+      LOG_ERROR(mLog, "Failed to parse the Hop key value pairs");
+      return;</span>
+   }
+   std::vector&lt;KeyValuePair&gt;::const_iterator hopIter;
+<span style = "background-color:#fdd">   bool hopEnabled = false;
+   for (hopIter = udpHopPairs.begin();
+        hopIter != udpHopPairs.end(); ++hopIter) {</span>
+      LOG_DEBUG(mLog, "Key: %s, Value: %s",
+<span style = "background-color:#fdd">                hopIter-&gt;key.c_str(), hopIter-&gt;value.c_str());
+      if (0 == hopIter-&gt;key.compare("enable")) {</span>
+         // If the key is enable, make sure the value is 1
+<span style = "background-color:#fdd">         hopEnabled = (0 == hopIter-&gt;value.compare("1"));</span>
+      }
+   }
+   LOG_DEBUG(mLog, "e2eEnabled: %d, versionMatch: %d, hopEnabled: %d",
+<span style = "background-color:#fdd">             e2eEnabled, versionMatch, hopEnabled);</span>
+
+   /*
+    * If both headers indicate UDP is enabled, and if we see an expected
+    * version, then we indicate that UDP headers are present.
+    */
+<span style = "background-color:#fdd">   udpHeadersPresent = e2eEnabled &amp;&amp; versionMatch &amp;&amp; hopEnabled;</span>
+
+<span style = "background-color:#fdd">   int endpointPort = 0;</span>
+
+   // If UDPv2 is used, find out which port the client must connect to.
+<span style = "background-color:#fdd">   if (udpHeadersPresent) {
+      if (!mConnectionCtrlMgr-&gt;GetEndpointPortFromVAuth(token, endpointPort)) {
+         LOG_ERROR(mLog, "Failed to get UDP Endpoint, disable UDP.");
+         udpHeadersPresent = false;</span>
+      }
+      LOG_INFO(mLog, "serverPort:%d, endpointPort:%d.",
+<span style = "background-color:#fdd">               serverPort, endpointPort);</span>
+   }
+
+<span style = "background-color:#fdd">   if (udpHeadersPresent) {</span>
+      LOG_INFO(mLog, "[BEAT] UDP is enabled by server and client, send UDP "
+<span style = "background-color:#fdd">                "meta-data in the upgrade header response.");</span>
+
+      /*
+       * X-VMW-Blast-UDP-E2E-Rsp is the end to end response (from the server).
+       * It contains "thumbprint", "versions", and "status".
+       * X-VMW-Blast-UDP-Hop-Rsp is the hop response. It is sent to the next
+       * hop. If there is no BSG, then this is directly received by the
+       * client. If there is a BSG, then the BSG will change the header
+       * contents sent by the server, so that the client sees whatever the BSG
+       * has inserted. This contains "IP", "Port", "enable", and "flow". Note
+       * that the flow must be set to the version by the service.
+       */
+
+      // Add IP, Port, Thumbprint
+<span style = "background-color:#fdd">      std::string thumbprint = "";
+      std::string thumbprint256 = "";</span>
+
+<span style = "background-color:#fdd">      if (mConfig) {
+         mConfig-&gt;GetHexString(CONFIG_SSL_HASH, thumbprint);
+         ASSERT(mAbCertManager != NULL);
+         mAbCertManager-&gt;GetSHA256Hash(thumbprint256);</span>
+      }
+
+<span style = "background-color:#fdd">      std::ostringstream portStringStream;
+      portStringStream &lt;&lt; serverPort;</span>
+      LOG_DEBUG(mLog, "ProxyIP: %s, ProxyPort: %s, Thumbprint: %s, "
+                "Thumbprint256: %s", serverIpAddr.c_str(),
+                portStringStream.str().c_str(),
+                Log_Thumbprint(thumbprint).c_str(),
+<span style = "background-color:#fdd">                Log_Thumbprint(thumbprint256).c_str());</span>
+
+<span style = "background-color:#fdd">      std::ostringstream e2eStringStreamRsp;</span>
+      e2eStringStreamRsp &lt;&lt; "thumbprint=" &lt;&lt; thumbprint
+         &lt;&lt; ",thumbprint256=" &lt;&lt; thumbprint256
+         &lt;&lt; ",port=" &lt;&lt; serverPort
+         &lt;&lt; ",status=0"
+<span style = "background-color:#fdd">         &lt;&lt; ",secondarysubprotocol=" &lt;&lt; finalSubprotocol;
+      std::string udpE2EResponse = e2eStringStreamRsp.str();
+      LOG_DEBUG(mLog, "udpE2EResponse: %s", udpE2EResponse.c_str());</span>
+
+      /*
+       * If we are using the filter driver, the hop port needs to be
+       * set to the serverPort, so that all traffic from remote clients
+       * will go to the same port. The filter driver will use the port
+       * provided in the label to route the packets correctly. This is
+       * the intended mode we will ship with.
+       * If we are not using the filter driver, then the hop port is the
+       * actual port where the worker is listening, so that the client can
+       * send datagrams directly to that port. This is intended as more of
+       * a diagnostic / debug mode.
+       */
+<span style = "background-color:#fdd">      bool enableFilterDriver = true;
+      if (mConfig) {
+         mConfig-&gt;GetBool(CONFIG_UDP_ENABLE_FILTER_DRIVER, enableFilterDriver);</span>
+      }
+      LOG_DEBUG(mLog, "enableFilterDriver: %s",
+<span style = "background-color:#fdd">                enableFilterDriver ? "true" : "false");</span>
+
+<span style = "background-color:#fdd">      std::ostringstream hopStringStreamRsp;
+      int label = endpointPort;
+      int hopPort = enableFilterDriver ? serverPort : endpointPort;</span>
+      hopStringStreamRsp &lt;&lt; "ip=" &lt;&lt; serverIpAddr
+         &lt;&lt; ",port=" &lt;&lt; hopPort
+         &lt;&lt; ",enable=1"
+<span style = "background-color:#fdd">         &lt;&lt; ",label=" &lt;&lt; std::setw(8) &lt;&lt; std::setfill('0') &lt;&lt; std::hex &lt;&lt; label;
+      std::string udpHopResponse = hopStringStreamRsp.str();
+      LOG_DEBUG(mLog, "udpHopResponse: %s", udpHopResponse.c_str());</span>
+
+<span style = "background-color:#fdd">      response-&gt;AddHeader("X-VMW-Blast-UDP-E2E-Rsp", udpE2EResponse);
+      response-&gt;AddHeader("X-VMW-Blast-UDP-Hop-Rsp", udpHopResponse);
+   }</span>
+
+<span style = "background-color:#fdd">   LOG_DEBUG(mLog, "Handled UDP related parts of the websocket upgrade");
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::ChooseSubProtocol() --
+ *
+ *    Given a list of subprotocols supported by the client, we need to pick
+ *    one that the Agent will support.
+ *
+ * Results:
+ *    true  -- Could successfully select a subprotocol
+ *    false -- Could not successfully select a subprotocol
+ *
+ * Side Effects:
+ *    If a subprotocol is found, it will be updated in finalSubprotocol.
+ *    Otherwise, finalSubprotocol will not be updated.
+ * ----------------------------------------------------------------------------
+ */
+
+bool
+RequestDispatcher2::ChooseSubProtocol(std::string clientList,
+                                      std::string&amp; finalSubprotocol)
+<span style = "background-color:#fdd">{
+   LOG_INFO(mLog, "ClientList: %s", clientList.c_str());
+   std::vector&lt;std::string&gt; serverSubprotocols;
+   serverSubprotocols.clear();</span>
+
+   /*
+    * Server supported secondary subprotocols. If we want to add a new
+    * secondary subprotocol, add it to the list below.
+    */
+<span style = "background-color:#fdd">   serverSubprotocols.push_back("udpv2");</span>
+
+   /*
+    * clientList is a list of subprotocols that the client supports. Parse this
+    * list and check each one. We assume that the list is in priority order.
+    * That is, the first subprotocol in the list is the one the client prefers
+    * the most.
+    */
+<span style = "background-color:#fdd">   std::vector&lt;std::string&gt; clientSubprotoList;
+   clientSubprotoList.clear();
+   std::string delimiter = "/";
+   boost::split(clientSubprotoList, clientList, boost::is_any_of(delimiter));
+   for (int i = 0; i &lt; clientSubprotoList.size(); i++) {
+      std::string clientProto = clientSubprotoList[i];
+      for (int j = 0; j &lt; serverSubprotocols.size(); j++) {</span>
+         LOG_INFO(mLog, "Compare client subprotocol %s with server subprotocol %s",
+<span style = "background-color:#fdd">                  clientProto.c_str(), serverSubprotocols[j].c_str());
+         if (0 == serverSubprotocols[j].compare(clientProto)) {</span>
+            // Match
+<span style = "background-color:#fdd">            LOG_INFO(mLog, "SubProtocol match: %s.", clientProto.c_str());
+            finalSubprotocol = clientProto;
+            return true;</span>
+         }
+      }
+<span style = "background-color:#fdd">   }
+   LOG_INFO(mLog, "Could not find a subprotocol match.");
+   return false;
+}</span>
+
+
+/*
+ * ----------------------------------------------------------------------------
+ * RequestDispatcher2::ParseClientConnectionInfo() --
+ *
+ *    Parse client connection information if available
+ *    in websocket headers. Else, return the defaults.
+ *
+ * Results:
+ *    None
+ *
+ * ----------------------------------------------------------------------------
+ */
+
+void
+RequestDispatcher2::ParseClientConnectionInfo(ClientRequest *cReq,        // IN
+                              ClientConnectionInfo&amp; clientConnectionInfo) // OUT
+<span style = "background-color:#fdd">{</span>
+   /*
+    * X-VMW-Blast-E2E-conn-info is the connection info (from the client).
+    * It contains "userMode", "brokerConn" and "primaryConn".
+    */
+   std::string clientConnectionInfoValue =
+<span style = "background-color:#fdd">                              cReq-&gt;GetHeaderValue("X-VMW-Blast-E2E-conn-info");
+   if (clientConnectionInfoValue.empty()) {
+      LOG_DEBUG(mLog, "No client connection info headers, nothing to do");
+      clientConnectionInfo.userConfigMode = BLAST_SERVICE_USER_MODE_TCP_ONLY;
+      clientConnectionInfo.brokerProtocol = BLAST_SERVICE_PROTOCOL_TCP;
+      clientConnectionInfo.primaryProtocol = BLAST_SERVICE_PROTOCOL_TCP;
+      return;</span>
+   }
+   LOG_DEBUG(mLog, "Client connection info value: %s",
+<span style = "background-color:#fdd">             clientConnectionInfoValue.c_str());</span>
+
+<span style = "background-color:#fdd">   clientConnectionInfo.userConfigMode = BLAST_SERVICE_USER_MODE_UNKNOWN;
+   clientConnectionInfo.brokerProtocol = BLAST_SERVICE_PROTOCOL_UNKNOWN;
+   clientConnectionInfo.primaryProtocol = BLAST_SERVICE_PROTOCOL_UNKNOWN;</span>
+
+   /*
+    * Parse client connection info E2E header and read configured user mode,
+    * protocol used by client for Broker and primary connection.
+    */
+<span style = "background-color:#fdd">   std::vector&lt;KeyValuePair&gt; clientConnectionInfoPairs;
+   clientConnectionInfoPairs.clear();</span>
+   bool bRet;
+   bRet = AbUtil::GetCommaSeparatedKeyValuePairs(clientConnectionInfoValue,
+<span style = "background-color:#fdd">                                                 clientConnectionInfoPairs);
+   if (!bRet) {
+      LOG_ERROR(mLog, "Failed to parse client connection info key value pairs");
+      return;</span>
+   }
+
+   std::vector&lt;KeyValuePair&gt;::const_iterator iter;
+<span style = "background-color:#fdd">   for (iter = clientConnectionInfoPairs.begin();
+        iter != clientConnectionInfoPairs.end(); ++iter) {</span>
+      LOG_DEBUG(mLog, "Key: %s, Value: %s",
+<span style = "background-color:#fdd">                iter-&gt;key.c_str(), iter-&gt;value.c_str());
+      if (0 == iter-&gt;key.compare("userMode")) {</span>
+         clientConnectionInfo.userConfigMode =
+<span style = "background-color:#fdd">                                AbUtil::GetUserConfigModeFromValue(iter-&gt;value);
+      } else if (0 == iter-&gt;key.compare("brokerConn")) {</span>
+         clientConnectionInfo.brokerProtocol =
+<span style = "background-color:#fdd">                                      AbUtil::GetProtocolFromValue(iter-&gt;value);
+      } else if (0 == iter-&gt;key.compare("primaryConn")) {</span>
+         clientConnectionInfo.primaryProtocol =
+<span style = "background-color:#fdd">                                      AbUtil::GetProtocolFromValue(iter-&gt;value);</span>
+      }
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * RequestDispatcher2::HandleWebSocketUpgrade
+ *
+ *    Called to handle client's upgrade (to websocket) request.
+ *    This will be moved to handler module in subsequent change set.
+ *    isUdpEnabled is provided to this function as an input argument to
+ *    indicate whether UDP is enabled on the server. We parse the websocket
+ *    request to see if the client wants to enable UDP, and udpHeadersPresent
+ *    is updated accordingly as an output parameter.
+ *
+ * Results:
+ *    Returns HttpStatusCode
+ *
+ * Side Effects:
+ *    When successful:
+ *    - update the ResponseObj
+ *    - update the cookieOut, vAuthOut, subProtocolOut
+ *      This should not belongs to the caller (i.e. Connection) as they are
+ *      blast-specific. They should not be part of the formal arguments.
+ *      But, for now, due to the way code is structure, this will do without
+ *      overhauling the logic flow (TODO: fix this).
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+IHttpResponse::HttpStatusCode
+RequestDispatcher2::HandleWebSocketUpgrade(ClientRequest *cReq,           // IN
+                              bool isUdpEnabled,                          // IN
+                              std::string udpIpAddr,                      // IN
+                              int udpPort,                                // IN
+                              std::string&amp; cookieOut,                     // OUT
+                              std::string&amp; subProtocolOut,                // OUT
+                              std::string&amp; vAuthOut,                      // OUT
+                              bool&amp; udpHeadersPresent,                    // OUT
+                              ClientConnectionInfo&amp; clientConnectionInfo) // OUT
+<span style = "background-color:#fdd">{
+   __int64 startTime = AbUtil::GetClock64();</span>
+
+<span style = "background-color:#fdd">   std::string key = cReq-&gt;GetHeaderValue("sec-websocket-key");</span>
+
+<span style = "background-color:#fdd">   const std::string verStr = cReq-&gt;GetHeaderValue("sec-websocket-version");
+   int version = atoi(verStr.c_str());
+   if (version &lt; 8) {</span>
+      // We only support HyBi right now.
+      LOG_ERROR(mLog, "Unsupported version (%I64d ms).",
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      return IHttpResponse::NOT_IMPLEMENTED;</span>
+   }
+
+<span style = "background-color:#fdd">   const std::string subproto = cReq-&gt;GetHeaderValue("sec-websocket-protocol");</span>
+   const http2::ISubprotocol* subp = NULL;
+<span style = "background-color:#fdd">   if (!(subp = http2::GetSubProtocol(subproto))) {</span>
+      LOG_ERROR(mLog, "Protocol list '%s' does not contain a supported "
+                "subprotocol (%I64d ms).",
+<span style = "background-color:#fdd">                subproto.c_str(), AbUtil::GetClock64() - startTime);
+      return IHttpResponse::NOT_IMPLEMENTED;</span>
+   }
+   LOG_DEBUG(mLog, "Using '%s' for protocol list '%s'.", subp-&gt;GetName().c_str(),
+<span style = "background-color:#fdd">             subproto.c_str());</span>
+
+<span style = "background-color:#fdd">   std::string cookieStr = cReq-&gt;GetHeaderValue("cookie");
+   std::string cookie = AbUtil::GetSessionCookieFromHeaderString(cookieStr);</span>
+
+   LOG_INFO(mLog, "WebSocket (v%d) creation requested with URL '%s', "
+            "subprotocol '%s', session cookie '%s'",
+            version,
+            AbUtil::RedactUrlQueryString(cReq-&gt;GetUri()).c_str(),
+            subp-&gt;GetName().c_str(),
+<span style = "background-color:#fdd">            Log_Token(cookie).c_str());</span>
+
+<span style = "background-color:#fdd">   std::string token = cReq-&gt;GetUriValue("vauth");
+   if (token.empty()) {</span>
+      LOG_ERROR(mLog, "vAuth is not specified, ignore websocket upgrade "
+<span style = "background-color:#fdd">                "request (%I64d ms).", AbUtil::GetClock64() - startTime);
+      return IHttpResponse::BAD_REQUEST;</span>
+   }
+<span style = "background-color:#fdd">   LOG_INFO(mLog, "vAuth is %s", Log_Token(token).c_str());</span>
+
+   /*
+    * This is to handle a race condition happens when:
+    * - service has not completed tearing down existing connection/session
+    * - client (re)send a new websocket upgrade request
+    * This situation happens when the service is "late" in cleaning up or
+    * tearing down existing session (e.g. tcp/ip stack late is late in
+    * notifying network disconnect) when the client detect the disconnect
+    * first, hence the connection retry request (ws upgrade request).
+    * Without this, client send reconnection request, service accept the
+    * upgrade request and failed when updating the connection map, resulting
+    * a zombie connection: bug 1450110.
+    */
+<span style = "background-color:#fdd">   if (mConnectionCtrlMgr-&gt;IsActiveSession(token)) {</span>
+      LOG_ERROR(mLog, "Connection with vAuth %s already has an active session "
+                "(%I64d ms)", Log_Token(token).c_str(),
+<span style = "background-color:#fdd">                AbUtil::GetClock64() - startTime);
+      return IHttpResponse::CONFLICT;</span>
+   }
+
+<span style = "background-color:#fdd">   if (!AuthenticateRequest(cReq)) {</span>
+      LOG_ERROR(mLog, "WebSocket request validation failed, denying access "
+<span style = "background-color:#fdd">                "(%I64d ms)", AbUtil::GetClock64() - startTime);
+      return IHttpResponse::FORBIDDEN;</span>
+   }
+
+   /*
+    * The upgrade request has been authenticated, so take a note of the
+    * fast-reconnect cookie from the authenticated request if it wasn't
+    * present on the incoming request, then build and send an affirmative
+    * response.
+    */
+
+<span style = "background-color:#fdd">   if (cookie.empty()) {
+      cookie = cReq-&gt;GetRequestCookie();</span>
+      LOG_DEBUG(mLog, "Connection %p: ReconnectCookie was empty. "
+                "Used from Upgrade request (%s)",
+<span style = "background-color:#fdd">                this, Log_Token(cookie).c_str());</span>
+   }
+
+<span style = "background-color:#fdd">   IHttpResponse *response = static_cast&lt;IHttpResponse *&gt;(cReq-&gt;GetResponse());
+   response-&gt;AddHeader("Upgrade", "websocket");
+   response-&gt;AddHeader("Sec-WebSocket-Protocol", subp-&gt;GetName());</span>
+
+   // Handshake acceptance nonce = b64(sha1(key + GUID))
+<span style = "background-color:#fdd">   std::string nonce = key + WEBSOCKET_GUID;</span>
+
+<span style = "background-color:#fdd">   unsigned char sha1nonce[EVP_MAX_MD_SIZE] = {0};
+   unsigned int sha1nonceLength = 0;
+   if (!EvpSha1(nonce, sizeof(sha1nonce), sha1nonce, &amp;sha1nonceLength)) {
+      LOG_ERROR(mLog, "Unable to generate digest.");
+      return IHttpResponse::INTERNAL_SERVER_ERROR;</span>
+   }
+
+<span style = "background-color:#fdd">   std::string b64nonce = AbUtil::Base64Encode(sha1nonce, sha1nonceLength);
+   response-&gt;AddHeader("Sec-WebSocket-Accept", b64nonce);</span>
+
+<span style = "background-color:#fdd">   if (isUdpEnabled) {</span>
+      BuildUdpResponse(cReq, udpIpAddr, udpPort, response,
+<span style = "background-color:#fdd">                       token, udpHeadersPresent);</span>
+   }
+
+   // Read Client connection info from Websocket header.
+<span style = "background-color:#fdd">   ParseClientConnectionInfo(cReq, clientConnectionInfo);</span>
+
+<span style = "background-color:#fdd">   subProtocolOut = subp-&gt;GetName();
+   cookieOut = cookie;
+   vAuthOut = token;</span>
+
+   LOG_INFO(mLog, "Connection %p upgraded to WebSocket, vauth %s "
+            "(%I64d ms)", this, Log_Token(token).c_str(),
+<span style = "background-color:#fdd">            AbUtil::GetClock64() - startTime);</span>
+
+<span style = "background-color:#fdd">   return IHttpResponse::OK;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * RequestDispatcher2::EvpSha1
+ *
+ *    Calling SHA1() will cause service to exit unexpectedly when running in
+ *    FIPS mode. Instead, use EVP function to generate the digest of the input
+ *    string.
+ *
+ * Result:
+ *    true or false on failure.
+ *    SHA1 digest of the input string and its length.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+RequestDispatcher2::EvpSha1(std::string&amp; in,                // IN
+                            unsigned int mdMaxSizeInBytes,  // IN
+                            unsigned char *mdOut,           // OUT
+                            unsigned int *mdLenOutInBytes)  // OUT
+{
+   if (in.empty() || !mdOut || !mdLenOutInBytes ||
+       (mdMaxSizeInBytes &lt; EVP_MAX_MD_SIZE)) {
+      LOG_ERROR(mLog, "Invalid argument for digest generation.");
+      return false;
+   }
+
+   EVP_MD_CTX mdCtx;
+   EVP_MD_CTX_init(&amp;mdCtx);
+
+   EVP_DigestInit(&amp;mdCtx, EVP_sha1());
+   EVP_DigestUpdate(&amp;mdCtx, in.c_str(), in.length());
+   EVP_DigestFinal(&amp;mdCtx, mdOut, mdLenOutInBytes);
+
+   EVP_MD_CTX_cleanup(&amp;mdCtx);
+
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * RequestDispatcher2::UpdatePrimaryWebSocketMap
+ *
+ *    Parse the URL to check whether this is a primary or secondary websocket.
+ *    If we have a primary websocket, extract the vAuth and insert the websocket
+ *    into the map, return true. If we have a secondary websocket, then search
+ *    for the primary websocket in the map, erase the entry, and return false.
+ *
+ * Results:
+ *    None.
+ *
+ * Side Effects:
+ *    If we pass in a primary websocket, it gets inserted into the map. If we
+ *    pass in a secondary websocket, and the paired primary websocket is found,
+ *    then the entry in the map is erased, and the primary websocket is tied
+ *    into the secondary websocket.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+RequestDispatcher2::UpdatePrimaryWebSocketMap(http2::IWebSocket *ws)
+<span style = "background-color:#fdd">{
+   boost::recursive_mutex::scoped_lock guard(mPrimaryWSMapLock);</span>
+
+<span style = "background-color:#fdd">   if (ws == NULL) {
+      LOG_ERROR(mLog, "NULL websocket");
+      return;</span>
+   }
+<span style = "background-color:#fdd">   std::string vAuth = ws-&gt;GetVAuth();</span>
+   LOG_INFO(mLog, "Primary WebSocket %p, vAuth:%s.", ws,
+<span style = "background-color:#fdd">            Log_Token(vAuth).c_str());</span>
+
+<span style = "background-color:#fdd">   boost::shared_ptr&lt;http2::IWebSocket&gt; primaryWS(ws);
+   mVAuthToPrimaryWebSocketMap[vAuth] = primaryWS;
+   primaryWS-&gt;WaitForDataAvailableASync();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * RequestDispatcher2::Push
+ *
+ *    Handling websocket push request (was original IWebSocketSink::Push.
+ *    See ConnectionCtrlMgr::Push()
+ *
+ * Results:
+ *    Returns True/False
+ *
+ * Side Effects:
+ *    See ConnectionCtrlMgr::Push()
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+RequestDispatcher2::Push(http2::IWebSocket *ws)
+<span style = "background-color:#fdd">{
+   if (mConnectionCtrlMgr != NULL) {
+      return mConnectionCtrlMgr-&gt;Push(ws);</span>
+   } else {
+<span style = "background-color:#fdd">      LOG_ERROR(mLog, "Connection manager is not initialized");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * RequestDispatcher2::NotifyDataAvailable
+ *
+ *    Notification when data is available on the websocket. This is used
+ *    for the fallback path for UDP (when we expect data on the UDP path,
+ *    but start seeing data on the TCP path).
+ *
+ * Results:
+ *    None.
+ *
+ * Side Effects:
+ *    Websocket is pushed into the Blast (ConnectionCtrlMgr).
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+RequestDispatcher2::NotifyDataAvailable(boost::shared_ptr&lt;http2::IWebSocket&gt; ws)
+<span style = "background-color:#fdd">{
+   if (!ws) {
+      LOG_ERROR(mLog, "Invalid websocket shared pointer.");
+      return;</span>
+   }
+
+   {
+<span style = "background-color:#fdd">      boost::recursive_mutex::scoped_lock guard(mPrimaryWSMapLock);</span>
+
+<span style = "background-color:#fdd">      std::string vAuth = ws-&gt;GetVAuth();</span>
+      LOG_INFO(mLog, "[BEAT Fallback] Data is available on ws:%p, vAuth:%s",
+<span style = "background-color:#fdd">                ws.get(), Log_Token(vAuth).c_str());</span>
+
+      // If the data is in the map, extract it and push it to Blast
+      LOG_DEBUG(mLog, "BEFORE: VAuth-WebSocket size:%3lu",
+<span style = "background-color:#fdd">                (unsigned long)mVAuthToPrimaryWebSocketMap.size());</span>
+
+      std::map&lt;std::string,
+         boost::shared_ptr&lt;http2::IWebSocket&gt;&gt;::const_iterator tokenToWSIter =
+<span style = "background-color:#fdd">            mVAuthToPrimaryWebSocketMap.find(vAuth);
+      if (tokenToWSIter != mVAuthToPrimaryWebSocketMap.end()) {</span>
+            boost::shared_ptr&lt;http2::IWebSocket&gt; savedPrimaryWS =
+<span style = "background-color:#fdd">               tokenToWSIter-&gt;second;</span>
+
+<span style = "background-color:#fdd">         if (ws.get() != savedPrimaryWS.get()) {</span>
+            LOG_ERROR(mLog, "Websocket %p in map did not match input ws %p",
+<span style = "background-color:#fdd">                      savedPrimaryWS.get(), ws);
+            return;</span>
+         }
+
+         LOG_INFO(mLog, "Found saved Primary WebSocket %p for vAuth %s",
+<span style = "background-color:#fdd">                  savedPrimaryWS.get(), Log_Token(vAuth).c_str());</span>
+
+<span style = "background-color:#fdd">         mVAuthToPrimaryWebSocketMap.erase(vAuth);</span>
+
+<span style = "background-color:#fdd">      } else {</span>
+         LOG_ERROR(mLog, "ws %p, vAuth %s: Not Found",
+<span style = "background-color:#fdd">                   ws, Log_Token(vAuth).c_str());
+         return;</span>
+      }
+      LOG_DEBUG(mLog, "AFTER: VAuth-WebSocket size:%3lu",
+<span style = "background-color:#fdd">             (unsigned long)mVAuthToPrimaryWebSocketMap.size());
+   }</span>
+
+   // Send the websocket to Blast
+<span style = "background-color:#fdd">   if (mConnectionCtrlMgr != NULL) {
+      mConnectionCtrlMgr-&gt;Push(ws);
+   } else {
+      LOG_ERROR(mLog, "Connection manager is not initialized");</span>
+   }
+<span style = "background-color:#fdd">}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * RequestDispatcher2::NotifyClientConnected
+ *
+ *    We have been notified that a client was connected for this vAuth. So
+ *    clear the primary websocket map, and mark that the primary websocket
+ *    is invalid to use. Even though we release the primary websocket
+ *    reference, the webSocket object should not get destroyed since we
+ *    have previously queued up a recv on this websocket. This ensures that
+ *    the primary connection stays alive (needed for the BSG to retain its
+ *    mapping). The reason we set the flag is so that when the primary
+ *    websocket is closed, we don't react on any data being received on
+ *    this path. Will be called only for UDP.
+ *
+ *    Ownership of the websocket is transferred to Blast (ConnectionMap)
+ *    since a connection has been made, and the websocket object is
+ *    thereafter managed by Blast, just like with TCP.
+ *
+ * Results:
+ *    None.
+ *
+ * Side Effects:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+RequestDispatcher2::NotifyClientConnected(const std::string&amp; vAuth) // IN
+<span style = "background-color:#fdd">{
+   boost::shared_ptr&lt;http2::IWebSocket&gt; savedPrimaryWS;</span>
+   {
+<span style = "background-color:#fdd">      boost::recursive_mutex::scoped_lock guard(mPrimaryWSMapLock);</span>
+
+      std::map&lt;std::string,
+         boost::shared_ptr&lt;http2::IWebSocket&gt;&gt;::const_iterator tokenToWSIter =
+<span style = "background-color:#fdd">            mVAuthToPrimaryWebSocketMap.find(vAuth);</span>
+
+      LOG_DEBUG(mLog, "BEFORE: VAuth-PrimaryWebSocket size:%3lu",
+<span style = "background-color:#fdd">                (unsigned long)mVAuthToPrimaryWebSocketMap.size());</span>
+
+<span style = "background-color:#fdd">      if (tokenToWSIter != mVAuthToPrimaryWebSocketMap.end()) {
+            savedPrimaryWS = tokenToWSIter-&gt;second;</span>
+
+         LOG_INFO(mLog, "Found primary WebSocket %p for vAuth %s",
+<span style = "background-color:#fdd">                  savedPrimaryWS.get(), Log_Token(vAuth).c_str());</span>
+
+<span style = "background-color:#fdd">         mVAuthToPrimaryWebSocketMap.erase(vAuth);</span>
+         LOG_DEBUG(mLog, "AFTER: VAuth-PrimaryWebSocket size:%3lu",
+<span style = "background-color:#fdd">                (unsigned long)mVAuthToPrimaryWebSocketMap.size());</span>
+      } else {
+         LOG_ERROR(mLog, "No primary websocket for vAuth %s",
+<span style = "background-color:#fdd">                   Log_Token(vAuth).c_str());
+         return;</span>
+      }
+<span style = "background-color:#fdd">   }</span>
+   /*
+    * Insert in ConnectionMap. Do this outside the scope of the above lock
+    * just to make sure we don't run into a deadlock scenario if a
+    * different thread also acquires these as nested locks.
+    */
+<span style = "background-color:#fdd">   IWorkerSessionMgr *workerSessionMgr = IWorkerSessionMgr::GetInstance();
+   ASSERT(workerSessionMgr != NULL);
+   if (!workerSessionMgr-&gt;AddPrimaryWebSocket(savedPrimaryWS)) {</span>
+      LOG_ERROR(mLog, "Failed to insert primary WebSocket %p",
+<span style = "background-color:#fdd">                savedPrimaryWS.get());</span>
+   }
+<span style = "background-color:#fdd">   savedPrimaryWS-&gt;SetClientConnectedToWorker();
+   if (savedPrimaryWS-&gt;IsClosingOrClosed()) {
+      workerSessionMgr-&gt;TerminateSession(savedPrimaryWS-&gt;GetVAuth());</span>
+   }
+<span style = "background-color:#fdd">}</span></pre>
+	</body>
+</html>

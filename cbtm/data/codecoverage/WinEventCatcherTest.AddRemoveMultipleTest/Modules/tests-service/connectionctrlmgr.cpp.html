@@ -1,0 +1,487 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>connectionctrlmgr.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2014-2017 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * ConnectionCtrlMgr.cpp --
+ *
+ *    Receives websockets from the network, creates ConnectionCtrl
+ *    instances, and manages the ConnectionCtrl instances. The
+ *    actual management of the individual connections, proxying,
+ *    etc. is handled by ConnectionCtrl.
+ */
+
+// appblast/common
+#include "ConsoleState.h"
+#include "IWebSocket.h"
+
+// appblast/pipelib
+#include "PipeCommon.h"
+
+// appblast/service
+#include "ConnectionCtrlMgr.h"
+#include "include/IConnectionCtrl.h"
+#include "include/IWorkerSessionMgr.h"
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::Create --
+ *
+ *      Create an instance of the ConnectionCtrl manager. See the notes at
+ *      the top of AuthenticateMgr for more details.
+ *
+ * Results:
+ *      ConnectionCtrlMgr instance.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+IConnectionCtrlMgr*
+ConnectionCtrlMgr::Create()
+{
+   return new ConnectionCtrlMgr();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::ConnectionCtrlMgr
+ *
+ *    Constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+ConnectionCtrlMgr::ConnectionCtrlMgr()
+   : mLog(log4cxx::Logger::getLogger("connectionctrlmgr")),
+     mWorkerSessionMgr(NULL)
+<span style = "background-color:#fdd">{</span>
+   // This is for WAVE reporter.
+<span style = "background-color:#fdd">   memset(&amp;mStatus, 0, sizeof(mStatus));
+   RegisterSelf();</span>
+   InitWaveQuery((WaveQuery*)&amp;mStatus,
+                 BLAST_AGENT_SERVICE,
+                 GENERIC_COMMAND_GET_STATUS,
+                 sizeof(mStatus),
+<span style = "background-color:#fdd">                 NULL, 0);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::~ConnectionCtrlMgr
+ *
+ *    Destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+ConnectionCtrlMgr::~ConnectionCtrlMgr()
+<span style = "background-color:#fdd">{</span>
+   // This is for WAVE reporter.
+<span style = "background-color:#fdd">   UnregisterSelf();
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::Initialize
+ *
+ *    Perform any needed initialization.
+ *
+ * Results:
+ *    true if the initialization succeeded, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrlMgr::Initialize(IWorkerSessionMgr* pWorkerSessionMgr)        // IN
+<span style = "background-color:#fdd">{
+   if (pWorkerSessionMgr == NULL) {
+      LOG_ERROR(mLog, "NULL WorkerSessionMgr interface pointer");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   mWorkerSessionMgr = pWorkerSessionMgr;</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::Release
+ *
+ *    Perform any needed cleanup.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+ConnectionCtrlMgr::Release()
+<span style = "background-color:#fdd">{</span>
+   /*
+    * Don't delete (just set to NULL), since we are just passed the interfaces
+    * in Initialize and we don't own the objects
+    */
+<span style = "background-color:#fdd">   mWorkerSessionMgr = NULL;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::Push
+ *
+ *    Handles a websocket push from the network. It will create a new
+ *    ConnectionCtrl instance and have that handle the rest of the work
+ *    for the connection. The ConnectionCtrl must also be added to the map.
+ *
+ * Results:
+ *    true if the push was successful, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrlMgr::Push(http2::IWebSocket* webSocket)   // IN
+<span style = "background-color:#fdd">{
+   if (webSocket == NULL) {
+      LOG_ERROR(mLog, "NULL websocket");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   IConnectionCtrl *pConnectionCtrl = IConnectionCtrl::CreateInstance();
+   if (pConnectionCtrl == NULL) {
+      LOG_ERROR(mLog, "Could not create ConnectionCtrl instance");
+      return false;</span>
+   }
+
+   /*
+    * Gives the connection control instance a shared pointer.
+    * Note that following shared_from_this() calls require a ready
+    * shared object here.
+    */
+<span style = "background-color:#fdd">   boost::shared_ptr&lt;IConnectionCtrl&gt; connectionCtrlSharedPtr;
+   connectionCtrlSharedPtr.reset(pConnectionCtrl);</span>
+
+<span style = "background-color:#fdd">   if (!pConnectionCtrl-&gt;Initialize(mWorkerSessionMgr)) {
+      LOG_ERROR(mLog, "Could not initialize ConnectionCtrl");
+      pConnectionCtrl-&gt;Release();
+      return false;</span>
+   }
+
+   // TODO: This can probably be folded into the Initialize()
+<span style = "background-color:#fdd">   if (!pConnectionCtrl-&gt;OnClientConnectCompleted(webSocket)) {
+      LOG_ERROR(mLog, "OnClientConnectCompleted failed");
+      pConnectionCtrl-&gt;Release();
+      return false;</span>
+   }
+
+   LOG_INFO(mLog, "Push succeeded, connectionCtrl %p, websocket %p.",
+<span style = "background-color:#fdd">            pConnectionCtrl, webSocket);</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::Push
+ *
+ *    Handles a websocket push from the network. It will create a new
+ *    ConnectionCtrl instance and have that handle the rest of the work
+ *    for the connection. The ConnectionCtrl must also be added to the map.
+ *
+ * Results:
+ *    true if the push was successful, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrlMgr::Push(boost::shared_ptr&lt;http2::IWebSocket&gt; webSocket)   // IN
+<span style = "background-color:#fdd">{
+   if (!webSocket) {
+      LOG_ERROR(mLog, "Invalid websocket shared pointer");
+      return false;</span>
+   }
+<span style = "background-color:#fdd">   IConnectionCtrl *pConnectionCtrl = IConnectionCtrl::CreateInstance();
+   if (pConnectionCtrl == NULL) {
+      LOG_ERROR(mLog, "Could not create ConnectionCtrl instance");
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   boost::shared_ptr&lt;IConnectionCtrl&gt; connectionCtrlSharedPtr;
+   connectionCtrlSharedPtr.reset(pConnectionCtrl);</span>
+
+<span style = "background-color:#fdd">   if (!pConnectionCtrl-&gt;Initialize(mWorkerSessionMgr)) {
+      LOG_ERROR(mLog, "Could not initialize ConnectionCtrl");
+      pConnectionCtrl-&gt;Release();
+      return false;</span>
+   }
+
+   // TODO: This can probably be folded into the Initialize()
+<span style = "background-color:#fdd">   if (!pConnectionCtrl-&gt;OnClientConnectCompleted(webSocket)) {
+      LOG_ERROR(mLog, "OnClientConnectCompleted failed");
+      pConnectionCtrl-&gt;Release();
+      return false;</span>
+   }
+
+   LOG_INFO(mLog, "Push succeeded, connectionCtrl %p, websocket %p.",
+<span style = "background-color:#fdd">            pConnectionCtrl, webSocket.get());</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::IsActiveSession --
+ *
+ *    Check whether we have an active session corresponding to the vauth token.
+ *
+ * Results:
+ *    true if active session exists, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrlMgr::IsActiveSession(const std::string&amp; vauth) const   // IN
+<span style = "background-color:#fdd">{
+   return mWorkerSessionMgr-&gt;IsActiveSession(vauth);
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::GetEndpointPortFromVAuth --
+ *
+ *    Determine what endpoint the client needs to connect to for UDPv2.
+ *    If we cannot properly get the port, do not modify the input port
+ *    argument.
+ *
+ * Results:
+ *    Port that the client needs to connect to for UDP. Return of true means
+ *    the function was successful, false means it was not successful.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrlMgr::GetEndpointPortFromVAuth(const std::string&amp; vauth, // IN
+                                            int&amp; port) const          // OUT
+<span style = "background-color:#fdd">{
+   DWORD wtsSessionId = mWorkerSessionMgr-&gt;GetWTSSessionId(vauth);
+   if (wtsSessionId == INVALID_TS_SESSION_ID) {</span>
+      LOG_ERROR(mLog, "Unable to retrieve WTSSessionID for vauth %s.",
+<span style = "background-color:#fdd">                Log_Token(vauth).c_str());
+      return false;</span>
+   }
+
+<span style = "background-color:#fdd">   std::string cmd = pipelib::ABIPC_GET_WORKER_UDP_CONTACT;
+   std::string response;</span>
+   if (!mWorkerSessionMgr-&gt;SendMessageToWorker(cmd, wtsSessionId,
+<span style = "background-color:#fdd">                                               false, response)) {</span>
+      LOG_ERROR(mLog, "Failed sending command:%s for WTSSessionID:%lu to "
+<span style = "background-color:#fdd">                "worker.", pipelib::GetCommandString(cmd), wtsSessionId);
+      return false;
+   } else if (response.empty()) {</span>
+      LOG_ERROR(mLog, "Succeeded sending command:%s for WTSSessionID:%lu to "
+                "worker, but response was empty.",
+<span style = "background-color:#fdd">                pipelib::GetCommandString(cmd), wtsSessionId);
+      return false;</span>
+   }
+
+   /*
+    * The response string is in the form &lt;IP&gt;:&lt;PORT&gt;, so partition it at the colon
+    * to obtain separate IP and PORT outputs.  Pick the rightmost colon so that we
+    * have a chance of working with IPv6 addresses.
+    */
+
+<span style = "background-color:#fdd">   size_t colonPos = response.rfind(':');
+   if (std::string::npos == colonPos) {</span>
+      LOG_ERROR(mLog, "No colon present in ABIPC_GET_WORKER_UDP_CONTACT "
+<span style = "background-color:#fdd">                "response '%s'", response.c_str());
+      return false;</span>
+   }
+
+   // We only care about the port, so just update that
+<span style = "background-color:#fdd">   std::string portStr = response.substr(1+colonPos, std::string::npos);
+   std::stringstream portSS(portStr);
+   portSS &gt;&gt; port;
+   LOG_INFO(mLog, "Got port:%d from the worker.", port);</span>
+
+<span style = "background-color:#fdd">   return true;
+}</span>
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::StatusData --
+ *
+ *      Return the address of the status structure.
+ *
+ * Results:
+ *      Address of the status structure.
+ *
+ * Side effects:
+ *      none.
+ *
+ *----------------------------------------------------------------------
+ */
+
+unsigned char *
+ConnectionCtrlMgr::StatusData(WaveQuery *pQuery, uint32 instance)
+<span style = "background-color:#fdd">{
+   DWORD wtsSessionId = pQuery-&gt;header.session;</span>
+   boost::shared_ptr&lt;http2::IWebSocket&gt; ws =
+      mWorkerSessionMgr-&gt;GetPrimaryWebSocket(
+<span style = "background-color:#fdd">         mWorkerSessionMgr-&gt;GetPrimaryVAuth(wtsSessionId));</span>
+
+<span style = "background-color:#fdd">   mStatus.statusFlags = 0;</span>
+
+<span style = "background-color:#fdd">   if (ws) {
+      mStatus.protocol = BLAST_SERVICE_PROTOCOL_TCP;</span>
+      LOG_INFO(mLog, "Protocol for WTS session id %lu is %s.", wtsSessionId,
+<span style = "background-color:#fdd">               mStatus.protocol == BLAST_SERVICE_PROTOCOL_UDP ? "UDP" : "TCP");</span>
+      ClientConnectionInfo clientConnectionInfo;
+<span style = "background-color:#fdd">      ws-&gt;GetClientConnectionInfo(clientConnectionInfo);</span>
+      LOG_INFO(mLog, "Client connection information - user config = %d, "
+                     "broker connection = %d, primary connection = %d",
+               clientConnectionInfo.userConfigMode,
+               clientConnectionInfo.brokerProtocol,
+<span style = "background-color:#fdd">               clientConnectionInfo.primaryProtocol);</span>
+
+<span style = "background-color:#fdd">      mStatus.userConfigMode = clientConnectionInfo.userConfigMode;
+      mStatus.brokerProtocol = clientConnectionInfo.brokerProtocol;
+      mStatus.primaryProtocol = clientConnectionInfo.primaryProtocol;
+   } else {
+      mStatus.protocol = BLAST_SERVICE_PROTOCOL_UNKNOWN;
+      LOG_ERROR(mLog, "Invalid websocket shared pointer");</span>
+   }
+
+<span style = "background-color:#fdd">   return (unsigned char *)&amp;mStatus;
+}</span>
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::StatusDataSize --
+ *
+ *      Return the size in byte of the status structure.
+ *
+ * Results:
+ *      size in byte of the status structure.
+ *
+ * Side effects:
+ *      none.
+ *
+ *----------------------------------------------------------------------
+ */
+
+unsigned int
+ConnectionCtrlMgr::StatusDataSize()
+<span style = "background-color:#fdd">{
+   return sizeof mStatus;
+}</span>
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * ConnectionCtrlMgr::HandleQuery --
+ *
+ *      Handle wave query
+ *
+ * Results:
+ *      none.
+ *
+ * Side effects:
+ *      none.
+ *
+ *----------------------------------------------------------------------
+ */
+
+bool
+ConnectionCtrlMgr::HandleQuery(WaveQuery* pQuery,
+                               uint32 instance)
+<span style = "background-color:#fdd">{</span>
+   WaveQueryStatus status = WAVE_FAILED;
+
+<span style = "background-color:#fdd">   switch(pQuery-&gt;header.command) {</span>
+   case GENERIC_COMMAND_GET_STATUS:
+<span style = "background-color:#fdd">      return Reporter::HandleQuery(pQuery, instance);</span>
+   case BLAST_CONNECT:
+   case BLAST_DISCONNECT:
+      LOG_WARN(mLog, "0x%x: Ignore wave command request 0x%x",
+<span style = "background-color:#fdd">               this, pQuery-&gt;header.command);
+      return false;</span>
+   default:
+      LOG_WARN(mLog, "Incorrect wave command request: 0x%x",
+<span style = "background-color:#fdd">               pQuery-&gt;header.command);</span>
+      break;
+   }
+
+<span style = "background-color:#fdd">   return ReplyQuery(pQuery, status);
+}</span>
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * IConnectionCtrlMgr::CreateInstance --
+ *
+ *      Create an instance of the ConnectionCtrl manager.
+ *
+ * Results:
+ *      Interface pointer.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+IConnectionCtrlMgr*
+IConnectionCtrlMgr::CreateInstance()
+<span style = "background-color:#fdd">{
+   return ConnectionCtrlMgr::Create();
+}</span></pre>
+	</body>
+</html>

@@ -1,0 +1,175 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+        <meta charset="utf-8"/>
+	    <title>handlerdefault.cpp</title>
+	    <link href="../../third-party/google-code-prettify/prettify-CppCoverage.css" type="text/css" rel="stylesheet" />
+	    <script type="text/javascript" src="../../third-party/google-code-prettify/prettify.js"></script>
+	</head>
+	<body onload="prettyPrint()">
+        <h4></h4>
+		<pre class="prettyprint lang-cpp linenums">
+/* **********************************************************
+ * Copyright (C) 2014-2015 VMware, Inc. All rights reserved.
+ * -- VMware Confidential
+ * **********************************************************/
+
+/*
+ * HandlerDefault.cpp --
+ *
+ *    Default handler implementation. Return error text response.
+ */
+
+
+#include "HandlerDefault.h"
+
+<span style = "background-color:#dfd">static const std::string LOG_NAME = "handlerDefault";</span>
+
+
+/*-----------------------------------------------------------------------------
+ *
+ * HandlerDefault::MethodNotAllowed
+ *
+ *    Response with text error.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+HandlerDefault::MethodNotAllowed(ClientRequest* cp)   // IN
+{
+   if (cp) {
+      cp-&gt;GetResponse()-&gt;RespondWithText(IHttpResponse::METHOD_NOT_ALLOWED, "",
+                                         "ERR:p:bad method");
+   }
+}
+
+
+/*-----------------------------------------------------------------------------
+ *
+ * HandlerDefault::HandlerDefault
+ *
+ *    Constructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+HandlerDefault::HandlerDefault() :
+   mLog(log4cxx::Logger::getLogger(LOG_NAME))
+<span style = "background-color:#fdd">{
+}</span>
+
+
+/*-----------------------------------------------------------------------------
+ *
+ * HandlerDefault::~HandlerDefault
+ *
+ *    Destructor.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+HandlerDefault::~HandlerDefault()
+<span style = "background-color:#fdd">{
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HandlerImpl::HandleGet
+ *
+ *    Default HTTP GET request handler.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+HandlerDefault::HandleGet(ClientRequest* cp)       // IN
+<span style = "background-color:#fdd">{
+   LOG_ERROR(mLog, "Not allowed");
+   MethodNotAllowed(cp);
+   return false;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HandlerImpl::HandlePost
+ *
+ *    Default HTTP POST request handler.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+HandlerDefault::HandlePost(ClientRequest* cp)      // IN
+<span style = "background-color:#fdd">{
+   LOG_ERROR(mLog, "Not allowed");
+   MethodNotAllowed(cp);
+   return false;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HandlerDefault::HandlePut
+ *
+ *    Default HTTP PUT request handler.
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+HandlerDefault::HandlePut(ClientRequest* cp)       // IN
+<span style = "background-color:#fdd">{
+   LOG_ERROR(mLog, "Not allowed");
+   MethodNotAllowed(cp);
+   return false;
+}</span>
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HandlerDefault::SetLogger
+ *
+ *    Set current logger
+ *
+ * Results:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+HandlerDefault::SetLogger(log4cxx::LoggerPtr logger)  // IN
+<span style = "background-color:#fdd">{
+   if (logger) {
+      mLog = logger;
+   } else {
+      LOG_ERROR(mLog, "Invalid logger");</span>
+   }
+<span style = "background-color:#fdd">}</span></pre>
+	</body>
+</html>
